@@ -63,6 +63,23 @@ public static class AobPatterns
             DispOffset:  3,   // rel32 starts after 48 39 2D
             InstrLen:    7,   // cmp [rip+rel32], rbp
             Description: "PoE2 GameStates global slot (GameHelper2 'Game States')"),
+
+        // RELAXED fallback. The strict pattern above pins the jnz's rel32 to 0x00000116 — a
+        // *jump distance*, which any recompile of the surrounding function changes even when the
+        // GameStates global itself is untouched. That is exactly how the 2026-09-04 patch broke
+        // the scan (strict pattern: 0 matches). Keeping only `cmp [rip+rel32], rbp` + the jnz
+        // opcode yields a handful of candidates instead of one; every consumer
+        // (Bootstrap.ResolveGameStateSlot / Research ResolveChain) already validates each candidate
+        // by walking the full chain to a "Metadata/" local player, so extra candidates are free.
+        // Ordered second so the strict pattern still short-circuits when it does match.
+        new Pattern(
+            Bytes: new byte?[] {
+                0x48, 0x39, 0x2D, null, null, null, null,
+                0x0F, 0x85
+            },
+            DispOffset:  3,
+            InstrLen:    7,
+            Description: "PoE2 GameStates global slot — relaxed (jnz displacement wildcarded)"),
     ];
 
     // Future root objects can be added here in the same form:

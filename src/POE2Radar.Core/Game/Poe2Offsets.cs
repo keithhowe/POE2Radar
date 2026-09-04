@@ -39,9 +39,9 @@ public static class Poe2
     /// </summary>
     public static class InGameState
     {
-        public const int AreaInstanceData = 0x290; // ✓ → AreaInstance (validated: target holds the local player)
-        public const int UiRoot           = 0x2F0; // ✓ → root UiElement (self-ref; children are UI elements)
-        public const int Camera           = 0x368; // ✓ → Camera object (Zoom @ +0x528 == 1.0 confirmed)
+        public const int AreaInstanceData = 0x2A0; // ✓ → AreaInstance (validated: target holds the local player). 2026-09-04 patch shifted +0x10 (was 0x290).
+        public const int UiRoot           = 0x300; // ✓ → root UiElement (self-ref; children are UI elements). 2026-09-04 patch shifted +0x10 (was 0x2F0).
+        public const int Camera           = 0x378; // ✓ → Camera object (Zoom @ +0x528 == 1.0 confirmed). 2026-09-04 patch shifted +0x10 (was 0x368).
         public const int WorldData        = 0x310; // (GH2-drift) → WorldData (area name + camera) — TBD
         public const int UiRootStructPtr  = 0x340; // (GH2-drift) reads 0 here — TBD
     }
@@ -57,17 +57,23 @@ public static class Poe2
     /// <para>⚠ GameHelper2's internal offsets are DRIFTED in this build — confirmed by the live
     /// probe (PlayerInfo moved from GH2's 0xA00 to ~0x598; LocalPlayer at 0x5B8). The values
     /// marked (GH2-drift) below must be re-discovered (see <c>--find-entities</c> / <c>--find-terrain</c>).</para>
+    ///
+    /// <para><b>This struct does NOT move as one block.</b> The 2026-09-04 patch shifted the
+    /// EARLY fields (AreaInfoPtr / AreaLevel / AreaHash) by <b>-0x08</b> while the LATE block
+    /// (ServerData / LocalPlayer / entity maps / terrain) moved <b>+0x10</b> — opposite
+    /// directions in the same struct. Re-derive each field independently with
+    /// <c>POE2Radar.Research --areascan</c>; never extrapolate one field's delta onto another.</para>
     /// </summary>
     public static class AreaInstance
     {
-        public const int AreaInfoPtr      = 0x0A0;  // ✓ → AreaInfo; +0x00 → UTF-16 "Code\0Name\0" (Code validated 'G1_town')
-        public const int LocalPlayer      = 0x5C0;  // ✓ → player Entity (value-scanned player matched here). 2026-07-16 patch shifted +0x08 (was 0x5B8); 2026-06-25 shifted +0x18 (was 0x5A0).
-        public const int ServerDataPtr    = 0x5A0;  // ✓ → ServerData (gateway to player inventories; +0x20 here = LocalPlayer @ 0x5C0). 2026-07-16 patch shifted +0x08 (was 0x598); 2026-06-25 shifted +0x18 (was 0x580).
-        public const int AwakeEntities    = 0x6E0;  // ✓ StdMap of live entities (id→EntityPtr). 2026-07-16 patch shifted +0x08 (was 0x6D8); 2026-06-25 shifted +0x18 (was 0x6C0).
-        public const int SleepingEntities = 0x6F0;  // ✓ StdMap. 2026-07-16 patch shifted +0x08 (was 0x6E8); 2026-06-25 shifted +0x18 (was 0x6D0).
-        public const int TerrainMetadata  = 0x8C0;  // ✓ TerrainStruct base. 2026-07-16 patch shifted +0x08 (was 0x8B8); 2026-06-25 shifted +0x18 (was 0x8A0).
-        public const int CurrentAreaLevel = 0x0C4;  // ✓ int — per-area, validated 27/32 (GH2's 0xBC drifted)
-        public const int CurrentAreaHash  = 0x11C;  // ✓ uint — per-area random hash (GH2's 0xFC drifted; +0x120 paired seed)
+        public const int AreaInfoPtr      = 0x098;  // ✓ → AreaInfo; +0x00 → UTF-16 "Code\0Name\0" (Code validated 'G1_15'). 2026-09-04 patch shifted -0x08 (was 0x0A0).
+        public const int LocalPlayer      = 0x5D0;  // ✓ → player Entity (value-scanned player matched here). 2026-09-04 patch shifted +0x10 (was 0x5C0); 2026-07-16 shifted +0x08 (was 0x5B8); 2026-06-25 shifted +0x18 (was 0x5A0).
+        public const int ServerDataPtr    = 0x5B0;  // ✓ → ServerData (gateway to player inventories; +0x20 here = LocalPlayer @ 0x5D0). 2026-09-04 patch shifted +0x10 (was 0x5A0); 2026-07-16 shifted +0x08 (was 0x598); 2026-06-25 shifted +0x18 (was 0x580).
+        public const int AwakeEntities    = 0x6F0;  // ✓ StdMap of live entities (id→EntityPtr). 2026-09-04 patch shifted +0x10 (was 0x6E0); 2026-07-16 shifted +0x08 (was 0x6D8); 2026-06-25 shifted +0x18 (was 0x6C0).
+        public const int SleepingEntities = 0x700;  // ✓ StdMap. 2026-09-04 patch shifted +0x10 (was 0x6F0); 2026-07-16 shifted +0x08 (was 0x6E8); 2026-06-25 shifted +0x18 (was 0x6D0).
+        public const int TerrainMetadata  = 0x8D0;  // ✓ TerrainStruct base. 2026-09-04 patch shifted +0x10 (was 0x8C0); 2026-07-16 shifted +0x08 (was 0x8B8); 2026-06-25 shifted +0x18 (was 0x8A0).
+        public const int CurrentAreaLevel = 0x0BC;  // ✓ int — per-area, validated 15 in G1_15. 2026-09-04 patch shifted -0x08 (was 0x0C4).
+        public const int CurrentAreaHash  = 0x114;  // ✓ uint — per-area random hash (+0x118 paired seed). 2026-09-04 patch shifted -0x08 (was 0x11C).
     }
 
     /// <summary>Entity StdMap conventions. Maps live at AreaInstance+0x6C0 (Awake) / +0x6D0 (Sleeping).</summary>
@@ -282,7 +288,7 @@ public static class Poe2
     /// +0x08 ptr InventoryStruct, +0x10 ptr (= +0x08 − 0x10, the fingerprint invariant).</summary>
     public static class ServerData
     {
-        public const int League = 0x21E0;  // ✓ live 2026-06-22 (--league) — std::wstring current league name, EXACTLY poe.ninja/poe2scout's Value (e.g. "HC Runes of Aldur", "Standard", "Hardcore"). The HC/SC prefix lets us auto-detect the price league.
+        public const int League = 0x2160;  // ✓ live 2026-09-04 (--areascan, read "Forbidden Rites") — std::wstring current league name, EXACTLY poe.ninja/poe2scout's Value (e.g. "HC Runes of Aldur", "Standard", "Hardcore"). The HC/SC prefix lets us auto-detect the price league. 2026-09-04 patch shifted -0x80 (was 0x21E0).
         public const int PlayerServerDataVec = 0x48;  // ✓ StdVector<IntPtr>; [0] → ServerDataStructure
         public const int PlayerInventoriesVec = 0x320; // ✓ (on ServerDataStructure) StdVector<InventoryArrayStruct>
         public const int InvArrayStride = 0x18;        // ✓ sizeof(InventoryArrayStruct)
@@ -457,9 +463,12 @@ public static class Poe2
     /// </summary>
     public static class MapUiElement
     {
-        public const int Shift        = 0x368; // ✓ StdTuple2D<float>
-        public const int DefaultShift = 0x370; // ✓ StdTuple2D<float> (0,-20)
-        public const int Zoom         = 0x3A8; // ✓ float (0.5 live)
+        // 2026-09-04 patch shifted this block -0x18 (was 0x368/0x370/0x3A8). The struct SHAPE is
+        // unchanged: Shift→DefaultShift = 8, DefaultShift→Zoom = 0x38. Re-found live via
+        // --find-map (exactly two elements carry DefaultShift=(0,-20) with Zoom=0.5).
+        public const int Shift        = 0x350; // ✓ StdTuple2D<float>
+        public const int DefaultShift = 0x358; // ✓ StdTuple2D<float> (0,-20)
+        public const int Zoom         = 0x390; // ✓ float (0.5 live)
     }
 
     /// <summary>UiElement base — ✓ validated live (GH2's offsets drifted: Self 0x30→0x8, Flags 0x1B8→0x180).
@@ -474,13 +483,18 @@ public static class Poe2
         public const int Parent         = 0xB8;  // (community) parent UiElement; true UI root = *(UiRoot+0xB8)
         public const int RelativePos    = 0x118; // ✓ StdTuple2D<float> position relative to parent (varies per atlas node)
         public const int LocalScaleMul  = 0x130; // float local scale multiplier (also the atlas zoom on node elements)
-        public const int Flags          = 0x180; // ✓ uint; IsVisibleLocal = bit 0x0B (toggle-diff: 0x2EF1↔0x26F1)
+        public const int Flags          = 0x168; // ✓ uint; IsVisibleLocal = bit 0x0B (toggle-diff: 0x2EF1↔0x26F1). 2026-09-04 patch shifted -0x18 (was 0x180); re-found live via --areascan (root 0x502EF0 / child 0x502EF1).
         public const int FlagVisibleBit = 0x0B;  // ✓ visible bit (set when shown)
         public const int FlagModifyPosBit = 0x0A; // when set, PositionModifier (+0xF0) is added to the parent pos
         public const int ScaleIndex     = 0x18A; // byte; selects which axis scale(s) apply (1=v1,2=v2,3=v1×v2). root=3
-        public const int Text           = 0x390; // std::wstring of the element's displayed text (font name @ +0xC8).
+        public const int Text           = 0x360; // std::wstring of the element's displayed text (font name @ +0xC8).
                                                   // Validated live 2026-06-14: every text element (loot tags, skill
                                                   // rows, runeforge rows) holds its UTF-16 string here.
+                                                  // 2026-09-04 patch shifted -0x30 (was 0x390) — NOT the -0x18 that
+                                                  // Flags/MapUiElement moved, so don't extrapolate. Confirmed by
+                                                  // content: +0x360 reads UI copy ("Entering Ogham Manor", "kills"),
+                                                  // while +0x378 holds internal element NAMES ("modal_dialog_overlay",
+                                                  // "HUD") and would silently pass a "is it a string?" check.
         public const int SizeW          = 0x288; // ✓ float unscaled width  (atlas node = 40)
         public const int SizeH          = 0x28C; // ✓ float unscaled height (atlas node = 40)
         // Full visibility is hierarchical: an element is shown iff its own bit 0x0B AND every

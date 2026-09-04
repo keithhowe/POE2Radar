@@ -197,6 +197,9 @@ if (HasFlag(args, "--validate"))
 if (HasFlag(args, "--info"))
     return RunInfo(process, reader);
 
+if (HasFlag(args, "--areascan"))
+    return RunAreaScan(process, reader);
+
 if (HasFlag(args, "--presence"))
     return RunPresence(process, reader, HasFlag(args, "--diff"));
 
@@ -416,7 +419,8 @@ Console.WriteLine("  --entity <hexAddr>         walk a PoE2 entity: id, metadata
 Console.WriteLine("  --rune-dump [--radius N]   dump nearby entities (path/components/MinimapIcon/small-ints) + tile paths near you");
 Console.WriteLine("  --presence [--diff]        baseline (then --diff) player components to find the presence-radius float");
 Console.WriteLine("  --devtree [--port N]       browser-based live memory/UI/entity explorer (default port 7778)");
-Console.WriteLine("  --serverdata               dump ServerData (AreaInstance+0x580): strings + StdVector quest-list candidates");
+Console.WriteLine("  --serverdata               dump ServerData (AreaInstance.ServerDataPtr): strings + StdVector quest-list candidates");
+Console.WriteLine("  --areascan                 post-patch re-validation of the InGameState/AreaInstance field block");
 Console.WriteLine("  --league [--needle <str>]  find the league-name string (HC/SC) in ServerData for price auto-detect");
 Console.WriteLine("  --aob                      scan for IngameState via AOB patterns");
 return 0;
@@ -447,13 +451,15 @@ static int RunServerData(ProcessHandle process, MemoryReader reader)
     var (_, _, ai, _) = ResolveChain(process, reader);
     if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
 
-    var playerInfo = ai + 0x580;
+    // Track the committed constants — these hard-coded literals went stale across three
+    // patches and made the probe report a bogus null ServerData.
+    var playerInfo = ai + Poe2.AreaInstance.ServerDataPtr;
     var serverData = SafePtr(reader, playerInfo);
     var localPlayer = SafePtr(reader, playerInfo + 0x20);
-    var validatedPlayer = SafePtr(reader, ai + 0x5A0);
-    Console.WriteLine($"AreaInstance 0x{ai:X}  PlayerInfo(+0x580) 0x{playerInfo:X}");
+    var validatedPlayer = SafePtr(reader, ai + Poe2.AreaInstance.LocalPlayer);
+    Console.WriteLine($"AreaInstance 0x{ai:X}  PlayerInfo(+0x{Poe2.AreaInstance.ServerDataPtr:X}) 0x{playerInfo:X}");
     Console.WriteLine($"  ServerDataPtr (+0x00) -> 0x{serverData:X}");
-    Console.WriteLine($"  LocalPlayerPtr(+0x20) -> 0x{localPlayer:X}   (AreaInstance+0x5A0 = 0x{validatedPlayer:X}, {(localPlayer == validatedPlayer && localPlayer != 0 ? "MATCH" : "mismatch")})");
+    Console.WriteLine($"  LocalPlayerPtr(+0x20) -> 0x{localPlayer:X}   (AreaInstance+0x{Poe2.AreaInstance.LocalPlayer:X} = 0x{validatedPlayer:X}, {(localPlayer == validatedPlayer && localPlayer != 0 ? "MATCH" : "mismatch")})");
     if (serverData == 0) { Console.Error.WriteLine("ServerData null — wrong offset or not in game."); return 1; }
 
     const int scan = 0x4000;
@@ -694,7 +700,7 @@ static int RunInventory(ProcessHandle process, MemoryReader reader, int onlyInv,
 
     var serverData = SafePtr(reader, ai + Poe2.AreaInstance.ServerDataPtr);
     var localPlayer = SafePtr(reader, ai + Poe2.AreaInstance.LocalPlayer);
-    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x580) 0x{serverData:X}  LocalPlayer(+0x5A0) 0x{localPlayer:X}");
+    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x{Poe2.AreaInstance.ServerDataPtr:X}) 0x{serverData:X}  LocalPlayer(+0x{Poe2.AreaInstance.LocalPlayer:X}) 0x{localPlayer:X}");
     if (serverData == 0) { Console.Error.WriteLine("ServerData null."); return 1; }
 
     // Step 1 — PlayerServerData vector @ ServerData+0x48; element [0] = the player's ServerDataStructure.
@@ -1491,7 +1497,9 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
 // name/level, camera/zoom — and dump the camera object so the WorldToScreen matrix can be found.
 static int RunInfo(ProcessHandle process, MemoryReader reader)
 {
-    var (igs, _, ai, lp) = ResolveChain(process, reader);
+    // 2nd element = InGameState (the 1st is GameState). Taking the 1st here made the Camera
+    // read below use the wrong base and report a bogus pointer.
+    var (_, igs, ai, lp) = ResolveChain(process, reader);
     if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
     Console.WriteLine($"InGameState 0x{igs:X}  AreaInstance 0x{ai:X}  LocalPlayer 0x{lp:X}");
 
@@ -1529,6 +1537,239 @@ static int RunInfo(ProcessHandle process, MemoryReader reader)
                 Console.WriteLine($"  +0x{i:X3}  {f}");
             }
     }
+    return 0;
+}
+
+// ── Post-patch re-validation of the InGameState / AreaInstance field block ──────────────
+// Every field is located by its OWN structural signature rather than by assuming the whole
+// block slid by one delta -- past patches moved sub-blocks independently, and a uniform-shift
+// assumption silently mis-reads the fields that did not move. Prints committed vs live so a
+// drift is a one-line diff. Run after a patch, in-game and loaded into a zone.
+static int RunAreaScan(ProcessHandle process, MemoryReader reader)
+{
+    var (_, igs, ai, lp) = ResolveChain(process, reader);
+    if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
+    Console.WriteLine($"InGameState 0x{igs:X}  AreaInstance 0x{ai:X}  LocalPlayer 0x{lp:X}\n");
+
+    // Area codes / league names are plain ASCII ("G1_town", "HC Runes of Aldur"). Requiring
+    // ASCII is what rejects the many pointer-garbage hits that decode as letter-like UTF-16.
+    static bool IsCodeLike(string s) =>
+        s.Length >= 3 && s.Length <= 40 &&
+        s.All(c => c < 128 && (char.IsLetterOrDigit(c) || c is '_' or '-' or ' '));
+
+    void Report(string field, int committed, List<(int off, string note)> hits)
+    {
+        if (hits.Count == 0)
+        {
+            Console.WriteLine($"  {field,-30} committed 0x{committed:X3}  ->  NOT FOUND (widen the scan / new signature needed)");
+            return;
+        }
+        foreach (var (off, note) in hits)
+        {
+            var delta = off - committed;
+            var status = delta == 0 ? "OK" : $"DRIFT {(delta >= 0 ? "+" : "-")}0x{Math.Abs(delta):X}";
+            Console.WriteLine($"  {field,-30} committed 0x{committed:X3}  ->  live 0x{off:X3}  {status,-12} {note}");
+        }
+    }
+
+    // AreaInfo: ai+off -> AreaInfo; *AreaInfo -> UTF-16 "Code\0Name\0".
+    var areaInfoHits = new List<(int, string)>();
+    for (var off = 0x00; off <= 0x300; off += 8)
+    {
+        var info = SafePtr(reader, ai + off);
+        if (info == 0) continue;
+        var code = reader.ReadStringUtf16(SafePtr(reader, info), 64);
+        if (IsCodeLike(code)) areaInfoHits.Add((off, $"code='{code}'"));
+    }
+    Report("AreaInstance.AreaInfoPtr", Poe2.AreaInstance.AreaInfoPtr, areaInfoHits);
+
+    // ServerData: prefer the STRUCTURAL signature (it survives a drifted League offset) --
+    // sd+0x48 vec -> [0] ServerDataStructure -> +0x320 inventories vec with a sane count.
+    // The league string is reported as corroboration when it still reads.
+    // Two-level: the inner hops (PlayerServerDataVec, PlayerInventoriesVec) can drift in the
+    // same patch as the outer pointer, so scan for them too instead of pinning them -- a fixed
+    // inner offset makes a perfectly good outer candidate look like a miss.
+    var serverHits = new List<(int, string)>();
+    for (var off = 0x400; off <= 0x800; off += 8)
+    {
+        var sd = SafePtr(reader, ai + off);
+        if (sd == 0) continue;
+
+        for (var pvOff = 0x00; pvOff <= 0x100 && serverHits.Count < 12; pvOff += 8)
+        {
+            var pv = SafePtr(reader, sd + pvOff);
+            if (pv == 0) continue;
+            var sds = SafePtr(reader, pv);
+            if (sds == 0) continue;
+
+            for (var invOff = 0x100; invOff <= 0x500; invOff += 8)
+            {
+                var first = SafePtr(reader, sds + invOff);
+                var last  = SafePtr(reader, sds + invOff + 8);
+                if (first == 0 || last <= first) continue;
+                var span = last - first;
+                if (span % Poe2.ServerData.InvArrayStride != 0) continue;
+                var count = span / Poe2.ServerData.InvArrayStride;
+                // Live count is ~117 (equipment + backpack + flasks + every stash tab), so a
+                // tight upper bound rejects the real ServerData. Keep this generous.
+                if (count is < 8 or > 400) continue;
+
+                // Corroboration, reported rather than required: the first InventoryArrayStruct's
+                // +0x10 is its +0x08 minus 0x10. Demanding it hides candidates when it drifts.
+                var invPtr = SafePtr(reader, first + Poe2.ServerData.InvArrayPtr);
+                var finger = SafePtr(reader, first + 0x10);
+                var fp = invPtr != 0 && finger == invPtr - 0x10 ? "fingerprint OK" : "fingerprint NO";
+
+                serverHits.Add((off, $"vec@+0x{pvOff:X2} inv@+0x{invOff:X3} count={count} {fp}"));
+                break;
+            }
+        }
+    }
+    Report("AreaInstance.ServerDataPtr", Poe2.AreaInstance.ServerDataPtr, serverHits);
+
+    // Independent anchor: ServerData carries the league name as a std::wstring around +0x21E0.
+    // Scanning a window recovers BOTH the outer pointer and a drifted League offset.
+    var leagueHits = new List<(int, string)>();
+    for (var off = 0x300; off <= 0xA00 && leagueHits.Count < 12; off += 8)
+    {
+        var sd = SafePtr(reader, ai + off);
+        if (sd == 0) continue;
+        for (var lOff = 0x2000; lOff <= 0x2400; lOff += 8)
+        {
+            var s = ReadStdWString(reader, sd + lOff);
+            if (s.Length < 6 || !IsCodeLike(s)) continue;
+            leagueHits.Add((off, $"League@+0x{lOff:X4} = '{s}'"));
+            break;
+        }
+    }
+    Report("AreaInstance.ServerDataPtr (league)", Poe2.AreaInstance.ServerDataPtr, leagueHits);
+
+    // AreaLevel: a plausible monster level. AreaHash: a large random uint (a small value
+    // means the offset is pointing at some unrelated counter).
+    var lvlHits = new List<(int, string)>();
+    for (var off = 0x80; off <= 0x200; off += 4)
+        if (reader.TryReadStruct<int>(ai + off, out var v) && v is >= 1 and <= 100)
+            lvlHits.Add((off, $"= {v}"));
+    Report("AreaInstance.CurrentAreaLevel", Poe2.AreaInstance.CurrentAreaLevel, lvlHits);
+
+    var hashHits = new List<(int, string)>();
+    for (var off = 0x80; off <= 0x200; off += 4)
+        if (reader.TryReadStruct<uint>(ai + off, out var h) && h > 0x00100000 && h != 0xFFFFFFFF)
+            hashHits.Add((off, $"= 0x{h:X8}"));
+    Report("AreaInstance.CurrentAreaHash", Poe2.AreaInstance.CurrentAreaHash, hashHits);
+
+    // Camera lives on InGameState; signature = Zoom float == 1.0 at camera+0x528.
+    var camHits = new List<(int, string)>();
+    for (var off = 0x200; off <= 0x600; off += 8)
+    {
+        var cam = SafePtr(reader, igs + off);
+        if (cam == 0) continue;
+        if (reader.TryReadStruct<float>(cam + Poe2.Camera.Zoom, out var z) && z == 1.0f)
+            camHits.Add((off, $"zoom@+0x{Poe2.Camera.Zoom:X}=1.0"));
+    }
+    Report("InGameState.Camera", Poe2.InGameState.Camera, camHits);
+
+    // UiRoot: a UiElement whose Self pointer (+0x08) points back at itself.
+    var uiHits = new List<(int, string)>();
+    for (var off = 0x200; off <= 0x600; off += 8)
+    {
+        var ui = SafePtr(reader, igs + off);
+        if (ui == 0) continue;
+        if (SafePtr(reader, ui + Poe2.UiElement.Self) == ui) uiHits.Add((off, "self-ref ok"));
+    }
+    Report("InGameState.UiRoot", Poe2.InGameState.UiRoot, uiHits);
+
+    // UiElement.Flags: the role/visibility bitfield. Signature -- a small non-zero uint whose
+    // low half matches the documented 0x?6F1/0x?EF1 shape, present on the root AND on a child
+    // (a field that is only non-zero on one of them is some other counter).
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
+    if (uiRoot != 0)
+    {
+        var kid = SafePtr(reader, SafePtr(reader, uiRoot + Poe2.UiElement.Children));
+        var flagHits = new List<(int, string)>();
+        for (var off = 0x100; off <= 0x220; off += 4)
+        {
+            if (!reader.TryReadStruct<uint>(uiRoot + off, out var rf) || rf == 0 || rf > 0x00FFFFFF) continue;
+            if ((rf & 0xF0) != 0xF0) continue;                       // 0x?6F1 / 0x?EF1 shape
+            var kidTxt = "";
+            if (kid != 0 && reader.TryReadStruct<uint>(kid + off, out var kf) && kf != 0)
+                kidTxt = $" child=0x{kf:X}";
+            else continue;                                            // must be set on both
+            flagHits.Add((off, $"root=0x{rf:X}{kidTxt}  visibleBit={(rf >> Poe2.UiElement.FlagVisibleBit) & 1}"));
+        }
+        Report("UiElement.Flags", Poe2.UiElement.Flags, flagHits);
+
+        // Parent: a child's back-pointer to the element we reached it from. Unambiguous.
+        if (kid != 0)
+        {
+            var parentHits = new List<(int, string)>();
+            for (var off = 0x40; off <= 0x140; off += 8)
+                if (SafePtr(reader, kid + off) == uiRoot) parentHits.Add((off, "-> UiRoot"));
+            Report("UiElement.Parent", Poe2.UiElement.Parent, parentHits);
+        }
+
+        // Text: no single element is a reliable oracle, so score offsets STATISTICALLY across a
+        // BFS sample -- the real Text field is the one holding readable ASCII on the most elements.
+        var sample = new List<nint>();
+        var seen = new HashSet<nint>();
+        var q = new Queue<nint>();
+        q.Enqueue(uiRoot);
+        while (q.Count > 0 && sample.Count < 500)
+        {
+            var e = q.Dequeue();
+            if (e == 0 || !seen.Add(e)) continue;
+            sample.Add(e);
+            var cb = SafePtr(reader, e + Poe2.UiElement.Children);
+            var ce = SafePtr(reader, e + Poe2.UiElement.ChildrenEnd);
+            if (cb == 0 || ce <= cb || (ce - cb) > 0x8000) continue;
+            for (var p = cb; p < ce && q.Count < 4000; p += 8) q.Enqueue(SafePtr(reader, p));
+        }
+
+        var scores = new Dictionary<int, int>();
+        foreach (var e in sample)
+            for (var off = 0x320; off <= 0x3C0; off += 8)
+            {
+                var s = ReadStdWString(reader, e + off);
+                if (s.Length < 2 || !s.All(c => c is >= ' ' and < (char)127)) continue;
+                scores[off] = scores.GetValueOrDefault(off) + 1;
+            }
+
+        var textHits = scores.OrderByDescending(kv => kv.Value).Take(3)
+            .Select(kv => (kv.Key, $"{kv.Value}/{sample.Count} elements hold ASCII text")).ToList();
+        Report("UiElement.Text", Poe2.UiElement.Text, textHits);
+
+        // Counts alone don't separate the real Text field from a neighbouring string (font /
+        // resource path), so show samples -- real Text reads as UI copy, not asset names.
+        foreach (var (off, _) in textHits)
+        {
+            var examples = sample
+                .Select(e => ReadStdWString(reader, e + off))
+                .Where(s => s.Length >= 2 && s.All(c => c is >= ' ' and < (char)127))
+                .Distinct().Take(6).ToList();
+            Console.WriteLine($"      +0x{off:X3} samples: {string.Join(" | ", examples)}");
+        }
+    }
+
+    // Area level / hash: report what the committed offsets currently hold (no unique signature).
+    reader.TryReadStruct<int>(ai + Poe2.AreaInstance.CurrentAreaLevel, out var lvl);
+    reader.TryReadStruct<uint>(ai + Poe2.AreaInstance.CurrentAreaHash, out var hash);
+    Console.WriteLine($"\n  AreaLevel @0x{Poe2.AreaInstance.CurrentAreaLevel:X3} = {lvl}"
+                    + $"   (plausible 1..100: {(lvl is > 0 and <= 100 ? "yes" : "NO -> drifted")})");
+    Console.WriteLine($"  AreaHash  @0x{Poe2.AreaInstance.CurrentAreaHash:X3} = 0x{hash:X8}"
+                    + $"   (non-zero: {(hash != 0 ? "yes" : "NO -> drifted")})");
+
+    // Vitals on the player's Life component.
+    var life = ResolveComponentAddr(reader, lp, "Life");
+    Console.WriteLine($"\n  Life component @0x{life:X}");
+    if (life != 0)
+        foreach (var (nm, o) in new[] { ("Health", Poe2.Life.Health), ("Mana", Poe2.Life.Mana), ("EnergyShield", Poe2.Life.EnergyShield) })
+        {
+            reader.TryReadStruct<int>(life + o + Poe2.Vital.Max, out var max);
+            reader.TryReadStruct<int>(life + o + Poe2.Vital.Current, out var cur);
+            var sane = max > 0 && cur >= 0 && cur <= max;
+            Console.WriteLine($"    {nm,-13} @0x{o:X3}  {cur}/{max}  {(sane ? "OK" : "** implausible -> drifted (run --vitals) **")}");
+        }
+
     return 0;
 }
 
@@ -8346,6 +8587,13 @@ static (nint gameState, nint inGameState, nint areaInstance, nint localPlayer) R
 static int RunChainDebug(ProcessHandle process, MemoryReader reader)
 {
     Console.WriteLine("\n=== CHAIN DEBUG ===");
+    // Windows scanned at the two hops that drift most across patches.
+    nint igsScanLo = 0x100, igsScanHi = 0x600;   // InGameState -> AreaInstance
+    nint aiScanLo  = 0x300, aiScanHi  = 0xA00;   // AreaInstance -> LocalPlayer
+
+    // Caps how many distinct AreaInstance candidates get the (expensive) wide entity scan.
+    var budget = new[] { 600 };
+    var playerHitCache = new Dictionary<nint, List<(nint off, string meta)>>();
     int patternIdx = 0;
     foreach (var pattern in AobPatterns.GameStateRefs)
     {
@@ -8366,25 +8614,61 @@ static int RunChainDebug(ProcessHandle process, MemoryReader reader)
             foreach (var (src, inGameState) in candidates)
             {
                 if (inGameState == 0) continue;
-                var areaInstance = SafePtr(reader, inGameState + Poe2.InGameState.AreaInstanceData);
-                // Only chase candidates whose +0x290 looks like a heap ptr.
-                if (areaInstance == 0) continue;
-                Console.WriteLine($"    {src,-20} InGameState 0x{inGameState:X16}  +0x{Poe2.InGameState.AreaInstanceData:X}=AreaInstance 0x{areaInstance:X16}");
 
-                // Wide scan inside the AreaInstance for the LocalPlayer pointer (metadata gate).
-                for (nint off = 0x400; off <= 0x700; off += 8)
+                // Scan the InGameState for the AreaInstance rather than trusting the committed
+                // +0x290: after a patch EITHER hop can move, and pinning this one hides the other.
+                for (var igsOff = igsScanLo; igsOff <= igsScanHi; igsOff += 8)
                 {
-                    var cand = SafePtr(reader, areaInstance + off);
-                    if (cand == 0) continue;
-                    var meta = ReadEntityMetadata(reader, cand);
-                    if (meta.StartsWith("Metadata/", StringComparison.Ordinal))
-                        Console.WriteLine($"        +0x{off:X3} -> 0x{cand:X16}  ENTITY [{meta}]");
+                    var areaInstance = SafePtr(reader, inGameState + igsOff);
+                    if (areaInstance == 0) continue;
+
+                    var players = LocalPlayerHits(reader, areaInstance, aiScanLo, aiScanHi, budget, playerHitCache);
+                    if (players.Count == 0) continue;
+
+                    var areaInfo = SafePtr(reader, areaInstance + Poe2.AreaInstance.AreaInfoPtr);
+                    var areaCode = areaInfo == 0 ? "" : reader.ReadStringUtf16(SafePtr(reader, areaInfo), 64);
+                    var mark = igsOff == Poe2.InGameState.AreaInstanceData ? " (committed)" : " ** DRIFTED **";
+
+                    Console.WriteLine($"    {src,-20} InGameState 0x{inGameState:X16}");
+                    Console.WriteLine($"      +0x{igsOff:X3} -> AreaInstance 0x{areaInstance:X16}  areaCode='{areaCode}'{mark}");
+                    foreach (var (off, meta) in players)
+                    {
+                        var m = off == Poe2.AreaInstance.LocalPlayer ? " (committed)" : " ** DRIFTED **";
+                        Console.WriteLine($"          AreaInstance +0x{off:X3} -> ENTITY [{meta}]{m}");
+                    }
                 }
             }
         }
     }
-    Console.WriteLine("\nLook for a '+0x??? ENTITY [Metadata/Characters/...]' line = the live LocalPlayer offset.");
+    Console.WriteLine($"\nCommitted: InGameState.AreaInstanceData = 0x{Poe2.InGameState.AreaInstanceData:X}, "
+                    + $"AreaInstance.LocalPlayer = 0x{Poe2.AreaInstance.LocalPlayer:X}");
+    Console.WriteLine("A 'Metadata/Characters/...' hit gives the live value for BOTH hops.");
     return 0;
+}
+
+// Every pointer inside `areaInstance` that resolves to a real "Metadata/..." entity.
+// `cache` is keyed by AreaInstance address (the same one is reached from many InGameState
+// slots) and `budget` caps the expensive wide scans, since the caller probes a wide window.
+static List<(nint off, string meta)> LocalPlayerHits(MemoryReader reader, nint areaInstance,
+    nint scanLo, nint scanHi, int[] budget, Dictionary<nint, List<(nint off, string meta)>> cache)
+{
+    if (cache.TryGetValue(areaInstance, out var cached)) return cached;
+
+    var hits = new List<(nint, string)>();
+    if (budget[0] > 0)
+    {
+        budget[0]--;
+        for (var off = scanLo; off <= scanHi; off += 8)
+        {
+            var cand = SafePtr(reader, areaInstance + off);
+            if (cand == 0) continue;
+            var meta = ReadEntityMetadata(reader, cand);
+            if (meta.StartsWith("Metadata/", StringComparison.Ordinal)) hits.Add((off, meta));
+        }
+    }
+
+    cache[areaInstance] = hits;
+    return hits;
 }
 
 static int RunChainProbe(ProcessHandle process, MemoryReader reader)
