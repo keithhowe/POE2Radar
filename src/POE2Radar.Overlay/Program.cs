@@ -1,8 +1,13 @@
 using POE2Radar.Core;
+using POE2Radar.Core.Game;
 using POE2Radar.Overlay;
 
 Console.WriteLine("POE2Radar — map/radar overlay");
 Console.WriteLine("=============================");
+
+// Say where the offsets came from BEFORE attaching: if a patch broke reads, the first question is
+// always "which offset table is this build actually using?".
+Console.WriteLine(OffsetOverrides.Describe());
 
 using var process = ProcessHandle.AttachToPoE();
 if (process is null)

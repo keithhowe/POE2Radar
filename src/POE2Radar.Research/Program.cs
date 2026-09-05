@@ -1856,7 +1856,7 @@ static int RunUiToggle(ProcessHandle process, MemoryReader reader, int seconds)
     // Is the fingerprint UNIQUE among UiRoot's children? If so the gate can be found by role bits
     // and survives index drift; if not, the index is the only usable key and must be re-checked
     // per patch (the trap AtlasPanel.UiRootChildIndex already sits in).
-    const uint visMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint visMask = 1u << Poe2.UiElement.FlagVisibleBit;
     foreach (var a in after)
     {
         if (!beforeByEl.TryGetValue(a.el, out var b) || VisBit(b.flags) == VisBit(a.flags)) continue;
@@ -3276,7 +3276,7 @@ static int RunTribute(ProcessHandle process, MemoryReader reader, string? extraN
     if (!string.IsNullOrWhiteSpace(extraNeedle)) needles.Add(extraNeedle.Trim());
 
     const int TextWStr = 0x390;
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
 
     // ── DFS the whole UiElement tree once, recording text-bearing + item-bearing elements. ──
     var textHits = new List<(nint el, int depth, uint flags, string text, bool needle)>();
@@ -3634,7 +3634,7 @@ static int RunTooltipCapture(ProcessHandle process, MemoryReader reader)
     if (gameUi == 0) { Console.Error.WriteLine("no GameUi"); return 1; }
     Console.WriteLine($"GameUi 0x{gameUi:X} — walking UI tree for item entities…\n");
 
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
     var visited = new HashSet<nint>();
     var seenItems = new HashSet<nint>();
     var stack = new Stack<(nint el, int depth)>();
@@ -3819,7 +3819,7 @@ static int RunSubtree(ProcessHandle process, MemoryReader reader, nint root, int
     float winW = 2560, winH = 1600; var hwnd = Win.FindMainWindowForPid((uint)process.ProcessId);
     if (hwnd != 0 && Win.GetClientRect(hwnd, out var rc) && rc.right > 0) { winW = rc.right; winH = rc.bottom; }
     float v1 = winW / 2560f, v2 = winH / 1600f;
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
 
     (float x, float y, float w, float h) Rect(nint el)
     {
@@ -3914,7 +3914,7 @@ static int RunTributeHover(ProcessHandle process, MemoryReader reader)
     float v1 = winW / 2560f, v2 = winH / 1600f;
     Console.WriteLine($"GameUi 0x{gameUi:X}  poe2Hwnd=0x{hwnd:X}  window {winW}x{winH}  cursor(client)=({cur.X},{cur.Y})\n");
 
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
     var hitsUnderCursor = new List<(nint el, int depth, float x, float y, float w, float h, float area)>();
     var visited = new HashSet<nint>();
     var stack = new Stack<(nint el, int depth)>();
@@ -4066,7 +4066,7 @@ static bool IsMostlyPrintable(string s)
 
 static void DumpUiEl(MemoryReader reader, nint el, int depth, uint flags, string note)
 {
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
     reader.TryReadStruct<float>(el + 0x118, out var rx);
     reader.TryReadStruct<float>(el + 0x11C, out var ry);
     reader.TryReadStruct<float>(el + 0x288, out var sw);
@@ -4079,7 +4079,7 @@ static void DumpUiEl(MemoryReader reader, nint el, int depth, uint flags, string
 // this node's index within it — the fingerprint trail for a resolve walk.
 static void DumpAncestors(MemoryReader reader, nint el)
 {
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
     var cur = el; var guard = 0;
     while (guard++ < 40)
     {
@@ -4297,7 +4297,7 @@ static int RunRuneforge(ProcessHandle process, MemoryReader reader)
     // Flag-fingerprint chain (GameHelper RuneforgeHelper, PoE2 0.5.x): window-container (gate, step 0)
     // → … → recipes-container. Match (flags & ~visibleBit); see RfWalk.
     uint[] fps = { 0x00462EF1, 0x00502EF3, 0x00502EF7, 0x00542EF1, 0x00502EF1 };
-    const uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit; // 0x800
+    uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit; // 0x800
     const int RuneforgeNameWString = 0x390;     // kid[0] inline "<count>x <name>" wstring
     nint slot = 0;
     foreach (var pat in AobPatterns.GameStateRefs)
@@ -4360,7 +4360,7 @@ static int RunRuneforge(ProcessHandle process, MemoryReader reader)
 // Flag-fingerprint walk with backtracking. step indexes fps; at the end, require a recipes-container.
 static nint RfWalk(MemoryReader reader, nint parent, int step, uint[] fps)
 {
-    const uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
     const int gateStep = 0; // window-container: only accept it visible (panel-open gate)
     if (step == fps.Length)
         return RfIsRecipesContainer(reader, parent) ? parent : 0;
@@ -4445,7 +4445,7 @@ static void RfParseNameCount(string raw, out int count, out string name)
 
 static void RfDumpChildFlags(MemoryReader reader, nint gameUi)
 {
-    const uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
     if (gameUi == 0 || !RfChildren(reader, gameUi, out var first, out var n)) { Console.WriteLine("(no GameUi children)"); return; }
     for (long i = 0; i < n && i < 40; i++)
     {
@@ -5006,7 +5006,7 @@ static int RunLootResolve(ProcessHandle process, MemoryReader reader)
     if (igs == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
     var gameUi = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
     if (gameUi == 0) { Console.Error.WriteLine("no GameUi."); return 1; }
-    const uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
     var fps = Poe2.GroundLabels.ContainerFlagFingerprints;
 
     bool Span(nint el, out nint first, out long n)
@@ -5071,7 +5071,7 @@ static int RunItemHover(ProcessHandle process, MemoryReader reader, int secs)
     if (uiRoot == 0) { Console.Error.WriteLine("no UiRoot."); return 1; }
 
     const int SlotItemOff = 0x4F8; // item-slot UiElement → item entity (flask bar / ritual tiles)
-    const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
 
     // Resolve a qword to a Metadata/Items entity — directly, or via one dereference.
     (nint item, string meta)? AsItem(nint cand)
@@ -5414,7 +5414,7 @@ static int RunExchange(ProcessHandle process, MemoryReader reader, string? stock
     float winW = 2560, winH = 1600; var hwnd = Win.GetForegroundWindow();
     if (hwnd != 0 && Win.GetClientRect(hwnd, out var rc) && rc.right > 0) { winW = rc.right; winH = rc.bottom; }
     Console.WriteLine($"UiRoot 0x{uiRoot:X}  window {winW:0}x{winH:0}");
-    const uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+    uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
 
     (float x, float y, float w, float h) Rect(nint el)
     {

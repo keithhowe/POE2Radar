@@ -527,7 +527,7 @@ public sealed class Poe2Live
         var first = (nint)BitConverter.ToInt64(_modVecBuf, 0);
         var last = (nint)BitConverter.ToInt64(_modVecBuf, 8);
         var len = (long)last - first;
-        const int stride = Poe2.ObjectMagicProperties.ModElemStride;
+        int stride = Poe2.ObjectMagicProperties.ModElemStride;
         if (first == 0 || len <= 0 || len > 0x4000 || len % stride != 0)
         {
             _mods[entity] = Array.Empty<string>(); return null; // no/garbage affix vector — cache as empty
@@ -1140,7 +1140,7 @@ public sealed class Poe2Live
         var result = new List<RitualReward>();
         var uiRoot = Ptr(inGameState + Poe2.InGameState.UiRoot);
         if (uiRoot == 0) return result;
-        const uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+        uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
 
         // 1) Confirm the shop is open + find a signature text element. BFS the VISIBLE tree (invisible
         //    subtrees pruned → cheap); the signature only renders while the tribute shop is up.
@@ -1241,7 +1241,7 @@ public sealed class Poe2Live
         var result = new List<(nint, string)>();
         var container = ResolveGroundLabelContainer(inGameState);
         if (container == 0) return result;
-        const uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+        uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
 
         var queue = new Queue<nint>(); queue.Enqueue(container);
         var visited = new HashSet<nint>();
@@ -1292,7 +1292,7 @@ public sealed class Poe2Live
     {
         var uiRoot = Ptr(inGameState + Poe2.InGameState.UiRoot);
         if (uiRoot == 0) return null;
-        const uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+        uint visBit = 1u << Poe2.UiElement.FlagVisibleBit;
 
         nint bestEl = 0, bestItem = 0; var bestArea = float.MaxValue;
 
@@ -1359,7 +1359,7 @@ public sealed class Poe2Live
     private nint WalkGroundLabels(nint parent, int step)
     {
         var fps = Poe2.GroundLabels.ContainerFlagFingerprints;
-        const uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
+        uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
         if (step == fps.Length) return parent;             // matched the full fingerprint path → container
         if (!ChildSpan(parent, out var first, out var n)) return 0;
         var target = fps[step] & ~visibleMask;

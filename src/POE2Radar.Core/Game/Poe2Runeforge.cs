@@ -84,7 +84,7 @@ public sealed class Poe2Runeforge
     private nint Walk(nint parent, int step)
     {
         var fps = Poe2.Runeforge.PanelFlagFingerprints;
-        const uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
+        uint visibleMask = 1u << Poe2.UiElement.FlagVisibleBit;
         if (step == fps.Length) return IsRecipesContainer(parent) ? parent : 0;
         if (!Children(parent, out var first, out var n)) return 0;
         var target = fps[step] & ~visibleMask;
