@@ -543,6 +543,8 @@ internal static class DashboardHtml
               <label class="sw"><input type="checkbox" data-set="useCuratedLandmarks"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Overlay FPS cap<small>lower = less load on the game; 60 is smooth for a radar (15&ndash;360)</small></div>
               <input class="numin" type="number" step="1" min="15" max="360" data-set="fpsCap"></div>
+            <div class="row"><div class="rl">Label declutter radius<small>entities matching the same rule within this many screen px share one label, drawn &ldquo;Name &times;N&rdquo; &mdash; every dot still draws. Stops multi-part set pieces (e.g. Act&nbsp;2&rsquo;s 9-part caravan) stacking identical text. 0 = off (0&ndash;300)</small></div>
+              <input class="numin" type="number" step="4" min="0" max="300" data-set="labelDeclusterPx"></div>
           </div>
           <div class="card">
             <h3>Monster HP Bars <span class="tag">&middot; by rarity</span></h3>

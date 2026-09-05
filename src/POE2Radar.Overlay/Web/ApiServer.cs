@@ -481,6 +481,7 @@ public sealed class ApiServer : IDisposable
         showMonsters = _settings.ShowMonsters,
         showTerrain = _settings.ShowTerrain,
         showPlayerBlip = _settings.ShowPlayerBlip,
+        labelDeclusterPx = _settings.LabelDeclusterPx,
         fpsCap = _settings.FpsCap,
         hpBarNormal = _settings.HpBarNormal,
         hpBarMagic = _settings.HpBarMagic,
@@ -533,7 +534,8 @@ public sealed class ApiServer : IDisposable
                 case "alwaysShowOverlay" when TryBool(p.Value, out var b): _settings.AlwaysShowOverlay = b; applied.Add(p.Name); break;
                 case "useCuratedLandmarks" when TryBool(p.Value, out var b): _settings.UseCuratedLandmarks = b; applied.Add(p.Name); break;
                 case "landmarkClusterGap" when TryInt(p.Value, out var n): _settings.LandmarkClusterGap = Math.Clamp(n, 0, 64); applied.Add(p.Name); break;
-                case "scaleMul" when TryFloat(p.Value, out var f): _settings.ScaleMul = f; applied.Add(p.Name); break;
+                case "labelDeclusterPx" when TryFloat(p.Value, out var f): _settings.LabelDeclusterPx = Math.Clamp(f, 0f, 300f); applied.Add(p.Name); break;
+            case "scaleMul" when TryFloat(p.Value, out var f): _settings.ScaleMul = f; applied.Add(p.Name); break;
                 case "offX" when TryFloat(p.Value, out var f): _settings.OffX = f; applied.Add(p.Name); break;
                 case "offY" when TryFloat(p.Value, out var f): _settings.OffY = f; applied.Add(p.Name); break;
                 case "showMonsters" when TryBool(p.Value, out var b): _settings.ShowMonsters = b; applied.Add(p.Name); break;

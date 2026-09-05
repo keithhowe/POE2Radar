@@ -232,4 +232,9 @@ public sealed record RenderContext(
     string? ExchangeFillNote = null,   // the recommended-sale-ratio headline for that quantity
     float ExchangePanelX = 0f,         // exchange-window screen rect top-left (pin anchor; 0 = default corner)
     float ExchangePanelY = 0f,
-    bool ExchangeCollapsed = false);   // card shrunk to a small "expand" tab
+    bool ExchangeCollapsed = false,    // card shrunk to a small "expand" tab
+    // ── Entity-label declustering. Radius in SCREEN px within which several entities resolving to the
+    //    same rule collapse to ONE label (drawn "Name xN"); their dots are all still drawn. Screen space
+    //    on purpose: whether two labels overlap depends on zoom + window height, so a world-grid
+    //    threshold would work at one zoom and fail at another. <= 0 disables. ──
+    float LabelDeclusterPx = 0f);

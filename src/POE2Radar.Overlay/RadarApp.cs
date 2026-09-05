@@ -1234,6 +1234,7 @@ public sealed class RadarApp : IDisposable
             ShowMonsters: _settings.ShowMonsters,
             ShowTerrain: _settings.ShowTerrain,
             ShowPlayerBlip: _settings.ShowPlayerBlip,
+            LabelDeclusterPx: _settings.LabelDeclusterPx,
             HpBarNormal: _settings.HpBarNormal,
             HpBarMagic: _settings.HpBarMagic,
             HpBarRare: _settings.HpBarRare,

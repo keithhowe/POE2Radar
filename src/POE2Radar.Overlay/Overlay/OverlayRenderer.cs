@@ -29,6 +29,14 @@ public sealed class OverlayRenderer : IDisposable
     private static readonly Color4 ColTargetMark = new(1f, 1f, 1f, 1f);          // active-target highlight in the legend
     private static readonly Color4 ColLowHp   = new(1.00f, 0.20f, 0.20f, 0.95f); // HP-bar fill when below 30% (rarity-independent)
 
+    /// <summary>One pending entity label. <see cref="Count"/> &gt; 1 means several entities matching the
+    /// same rule landed within the decluster radius and share this label (drawn "Text xN").</summary>
+    private readonly record struct LabelSlot(float X, float Y, string Text, int Count, Color4 Color);
+
+    // Reused across frames: the render loop runs at up to the monitor refresh rate, so this must not
+    // allocate a fresh list every frame. Cleared at the start of each entity pass.
+    private readonly List<LabelSlot> _labelSlots = new();
+
     // Distinct, evenly-spread hues for per-landmark guidance paths / legend swatches.
     private static readonly Color4[] PathPalette =
     {
@@ -1024,6 +1032,10 @@ public sealed class OverlayRenderer : IDisposable
         // the first enabled rule that matches the entity (top-down, explicit precedence); null or a
         // Hide rule → not drawn; otherwise draw the rule's shape/color/size + optional label. (Junk is
         // still a pre-filter in Phase 1; the API serves every entity regardless for troubleshooting.)
+        // Dots are drawn immediately; LABELS are deferred so identical ones landing on top of each
+        // other can collapse into a single "Name xN" (see LabelDeclusterPx). Without this, a
+        // multi-part set piece writes its label once per part — Act 2's caravan stacks 9 of them.
+        _labelSlots.Clear();
         foreach (var e in ctx.Entities)
         {
             if (ctx.HideJunk && JunkFilter.IsJunk(e.Metadata)) continue;
@@ -1034,8 +1046,35 @@ public sealed class OverlayRenderer : IDisposable
             var p = Project(new NumVec2(e.Grid.X, e.Grid.Y), player, center, scale);
             _bStyle!.Color = ParseColor(rule.Color, rule.Opacity);
             DrawIcon(rt, rule.Shape, p, rule.Size, _bStyle, filled: true);
-            if (!string.IsNullOrEmpty(rule.Label))
-                rt.DrawText(rule.Label, _tf!, new Rect(p.X + 7, p.Y - 7, p.X + 240, p.Y + 9), _bStyle, DrawTextOptions.Clip);
+
+            if (string.IsNullOrEmpty(rule.Label)) continue;
+
+            // Merge into an existing slot with the same text within the decluster radius; the slot
+            // keeps the FIRST position so the label doesn't drift as members move.
+            var merged = false;
+            if (ctx.LabelDeclusterPx > 0f)
+            {
+                var r2 = ctx.LabelDeclusterPx * ctx.LabelDeclusterPx;
+                for (var i = 0; i < _labelSlots.Count; i++)
+                {
+                    var s = _labelSlots[i];
+                    if (!ReferenceEquals(s.Text, rule.Label) && s.Text != rule.Label) continue;
+                    float dx = s.X - p.X, dy = s.Y - p.Y;
+                    if (dx * dx + dy * dy > r2) continue;
+                    _labelSlots[i] = s with { Count = s.Count + 1 };
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged)
+                _labelSlots.Add(new LabelSlot(p.X, p.Y, rule.Label!, 1, ParseColor(rule.Color, rule.Opacity)));
+        }
+
+        foreach (var s in _labelSlots)
+        {
+            _bStyle!.Color = s.Color;
+            var text = s.Count > 1 ? $"{s.Text} x{s.Count}" : s.Text;
+            rt.DrawText(text, _tf!, new Rect(s.X + 7, s.Y - 7, s.X + 240, s.Y + 9), _bStyle, DrawTextOptions.Clip);
         }
 
         // Static tile landmarks (boss arena, treasure, …). Each is styled by its matching "Tile"

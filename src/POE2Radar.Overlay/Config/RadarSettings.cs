@@ -30,6 +30,15 @@ public sealed class RadarSettings
     // The player position blip at map-center. Default on (prior behavior); some prefer it off.
     public bool ShowPlayerBlip { get; set; } = true;
 
+    // ── Entity-label declustering. Several entities matching the SAME display rule within this many
+    //    SCREEN pixels collapse to one label drawn "Name xN"; every dot is still drawn, only the text
+    //    collapses. Multi-part set pieces are the motivating case (Act 2's caravan puts 9 identical
+    //    Gates_Caravan_Pullteam entities ~25px apart while the label renders ~84px wide, so the text
+    //    piles up), but it applies to any cluster — town NPCs, grouped chests, stacked transitions.
+    //    Measured in screen space deliberately: overlap depends on zoom + window height, so a
+    //    world-grid threshold would be correct at one zoom and wrong at another. 0 = disabled.
+    public float LabelDeclusterPx { get; set; } = 48f;
+
     // ── Overlay render/present rate (Hz). The overlay redraws + UpdateLayeredWindow-blits at this
     //    rate; lower = less CPU/GPU tax on the game (the blit cost is proportional to resolution).
     //    0 = AUTO: match the refresh rate of the monitor the game is on (re-detected ~1/s) — recommended,
