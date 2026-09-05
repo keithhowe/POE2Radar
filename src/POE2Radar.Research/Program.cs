@@ -117,7 +117,11 @@ if (TryGetStrArg(args, "--exchange-pairs") is { } pairsArg)
 
 if (HasFlag(args, "--mouseover"))
     return RunMouseOver(process, reader,
-        TryGetHexArg(args, "--h") ?? 0x300, TryGetHexArg(args, "--s") ?? 0x3F0, TryGetHexArg(args, "--e") ?? 0xA8,
+        // Default to the committed constants, not literals — hard-coded copies here went stale
+        // across patches and made the probe "verify" an offset the overlay no longer uses.
+        TryGetHexArg(args, "--h") ?? Poe2.MouseOver.HostFromInGameState,
+        TryGetHexArg(args, "--s") ?? Poe2.MouseOver.SubFromHost,
+        TryGetHexArg(args, "--e") ?? Poe2.MouseOver.EntityFromSub,
         HasFlag(args, "--scan"), HasFlag(args, "--hunt"));
 
 if (HasFlag(args, "--itemhover"))
@@ -5231,7 +5235,18 @@ static int RunMouseOver(ProcessHandle process, MemoryReader reader, nint hOff, n
         Console.WriteLine($"\n{ranked.Count} combos yielded ≥2 distinct entities (cursor-tracking candidates):");
         foreach (var kv in ranked.Take(15))
             Console.WriteLine($"  host=+0x{kv.Key.Item1:X} sub=+0x{kv.Key.Item2:X} ent=+0x{kv.Key.Item3:X}  distinct={kv.Value.Count}  last={lastMeta[kv.Key]}");
-        if (ranked.Count == 0) Console.WriteLine("  none changed — try sweeping over more varied world objects, or the chain differs from the documented shape.");
+        if (ranked.Count == 0) Console.WriteLine("  none changed — the cursor may have been stationary (see single-entity hits below).");
+
+        // A stationary hover can only ever produce ONE distinct entity, so the >=2 rule above
+        // reports nothing even when the right combo was found. Sweeping isn't always practical
+        // (e.g. the cursor is also needed to leave the game window), so surface the single-entity
+        // hits too: with the cursor parked on a known target these are still a strong shortlist.
+        var singles = seen.Where(kv => kv.Value.Count == 1).ToList();
+        Console.WriteLine($"\n{singles.Count} combo(s) resolved exactly ONE valid entity (usable with a parked cursor):");
+        foreach (var kv in singles.OrderBy(kv => kv.Key.Item1).ThenBy(kv => kv.Key.Item2).ThenBy(kv => kv.Key.Item3).Take(25))
+            Console.WriteLine($"  host=+0x{kv.Key.Item1:X} sub=+0x{kv.Key.Item2:X} ent=+0x{kv.Key.Item3:X}  -> {lastMeta[kv.Key]}");
+        if (singles.Count == 0)
+            Console.WriteLine("  none — nothing was hovered, or the chain differs from the documented shape.");
         return 0;
     }
 

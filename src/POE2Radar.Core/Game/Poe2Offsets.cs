@@ -532,7 +532,10 @@ public static class Poe2
     /// Cheap ground-truth for "what is the user pointing at", invaluable for mapping entities/elements.</summary>
     public static class MouseOver
     {
-        public const int HostFromInGameState = 0x300; // ✓ → host object
+        // 2026-09-04 patch shifted +0x10 (was 0x300) — the old value now collides with UiRoot, so
+        // the chain silently dead-ended on a UiElement instead of the hover host. Re-derived live
+        // via Research --mouseover --hunt (resolved the hovered NPC). sub/ent hops unchanged.
+        public const int HostFromInGameState = 0x310; // ✓ → host object
         public const int SubFromHost         = 0x3F0; // ✓ → sub object
         public const int EntityFromSub       = 0xA8;  // ✓ → hovered Entity (0 when nothing/UI hovered)
     }
