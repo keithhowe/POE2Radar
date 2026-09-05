@@ -164,6 +164,11 @@ public sealed class RadarSettings
     // WaygateDevice waygate) into existing display_rules.json configs. Additive; set true after seeding so a
     // user who deletes the rule keeps it gone. Fresh configs get them via DisplayRules.BuildDefault.
     public bool BuiltInTileRulesSeeded { get; set; }
+    // One-time guard: lets the "Point of Interest" rule apply to the Chest category and seeds the Corpse
+    // rule. A game-flagged quest container (Poi=true, Normal rarity, not a StrongBox/QuestChest) matched
+    // NO rule before this and silently never drew. Additive + name-guarded, so a user's own edits and
+    // deletions stick.
+    public bool PoiChestRulesV1 { get; set; }
 
     // ── Auto-flask master enable (the F8 in-game kill-switch persists here so a disabled state survives
     //    a restart). Defaults ON to preserve the historical "auto-on each launch" behavior. NOTE: this is

@@ -210,6 +210,9 @@ if (HasFlag(args, "--uitoggle"))
 if (HasFlag(args, "--mapdiag"))
     return RunMapDiag(process, reader, TryGetIntArg(args, "--secs") ?? 0);
 
+if (HasFlag(args, "--sleeping"))
+    return RunSleeping(process, reader, TryGetStrArg(args, "--needle"));
+
 if (HasFlag(args, "--huddiag"))
     return RunHudDiag(process, reader, TryGetIntArg(args, "--secs") ?? 0);
 
@@ -1794,6 +1797,70 @@ static int RunAreaScan(ProcessHandle process, MemoryReader reader)
             Console.WriteLine($"    {nm,-13} @0x{o:X3}  {cur}/{max}  {(sane ? "OK" : "** implausible -> drifted (run --vitals) **")}");
         }
 
+    return 0;
+}
+
+// ── Sleeping-entity map survey ───────────────────────────────────────────────────────────
+// Poe2Live.Entities() walks ONLY AwakeEntities, so anything outside the network bubble is
+// invisible to the overlay. The Sleeping map is far larger (1370 vs 78 observed), and if static
+// interactables — quest corpses, chests, transitions — live there while out of range, they could
+// be surfaced map-wide instead of only when the player walks up to them. This dumps what is
+// actually in that map so the question is answered with data rather than assumption.
+static int RunSleeping(ProcessHandle process, MemoryReader reader, string? needle)
+{
+    var (_, _, ai, _) = ResolveChain(process, reader);
+    if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
+
+    foreach (var (label, off) in new[]
+             { ("Awake", Poe2.AreaInstance.AwakeEntities), ("Sleeping", Poe2.AreaInstance.SleepingEntities) })
+    {
+        var head = SafePtr(reader, ai + off);
+        reader.TryReadStruct<int>(ai + off + 8, out var size);
+        Console.WriteLine($"\n=== {label}Entities @+0x{off:X}  head=0x{head:X}  size={size} ===");
+        if (head == 0 || size <= 0) { Console.WriteLine("  (empty)"); continue; }
+
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var hits = new List<(uint id, nint ent, string meta)>();
+        var visuals = 0; var blank = 0;
+
+        var q = new Queue<nint>(); q.Enqueue(SafePtr(reader, head + Poe2.StdMapNode.Parent));
+        var seen = new HashSet<nint>();
+        while (q.Count > 0 && seen.Count < 200000)
+        {
+            var node = q.Dequeue();
+            if (node == 0 || node == head || !seen.Add(node)) continue;
+            if (!reader.TryReadStruct<byte>(node + Poe2.StdMapNode.IsNil, out var nil) || nil != 0) continue;
+            q.Enqueue(SafePtr(reader, node + Poe2.StdMapNode.Left));
+            q.Enqueue(SafePtr(reader, node + Poe2.StdMapNode.Right));
+
+            var ent = SafePtr(reader, node + Poe2.StdMapNode.ValueEntityPtr);
+            if (ent == 0) continue;
+            reader.TryReadStruct<uint>(node + Poe2.StdMapNode.KeyId, out var id);
+            if (id >= Poe2.EntityList.VisualIdThreshold) { visuals++; continue; }
+
+            var meta = ReadEntityMetadata(reader, ent);
+            if (meta.Length == 0) { blank++; continue; }
+
+            // Bucket by the metadata's top two path segments to see the shape of the map.
+            var parts = meta.Split('/');
+            var key = parts.Length >= 3 ? $"{parts[0]}/{parts[1]}/{parts[2]}" : meta;
+            counts[key] = counts.GetValueOrDefault(key) + 1;
+
+            if (needle is { Length: > 0 } && meta.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                hits.Add((id, ent, meta));
+        }
+
+        Console.WriteLine($"  walked {seen.Count} nodes — {counts.Values.Sum()} real entities, {visuals} visual-id, {blank} unreadable");
+        foreach (var kv in counts.OrderByDescending(k => k.Value).Take(20))
+            Console.WriteLine($"    {kv.Value,5}  {kv.Key}");
+
+        if (needle is { Length: > 0 })
+        {
+            Console.WriteLine($"  matches for \"{needle}\": {hits.Count}");
+            foreach (var (id, ent, meta) in hits.Take(15))
+                Console.WriteLine($"    id {id,-8} 0x{ent:X}  {meta}");
+        }
+    }
     return 0;
 }
 

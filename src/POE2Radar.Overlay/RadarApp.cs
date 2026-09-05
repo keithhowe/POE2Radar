@@ -406,6 +406,35 @@ public sealed class RadarApp : IDisposable
             }
             _settings.BuiltInTileRulesSeeded = true; _settings.Save();
         }
+        // One-time: let "Point of Interest" cover game-flagged CHESTS, and seed the Corpse rule. Before
+        // this, a quest corpse (category Chest, Poi=true, Normal rarity) matched no rule at all and never
+        // drew — the POI catch-all was scoped to Object/Other. Both steps are guarded so a user who
+        // removes either keeps it removed.
+        if (!_settings.PoiChestRulesV1)
+        {
+            var rules = _displayRules.All.ToList();
+            var changed = 0;
+
+            var poi = rules.FirstOrDefault(r => string.Equals(r.Name, "Point of Interest", StringComparison.Ordinal));
+            if (poi is { Categories.Count: > 0 } && !poi.Categories.Contains("Chest"))
+            { poi.Categories.Add("Chest"); changed++; }
+
+            // Insert ahead of the generic per-rarity chest rules so the dedicated marker wins.
+            var insertAt = rules.FindIndex(r => r.Name.StartsWith("Chest", StringComparison.Ordinal));
+            foreach (var r in DisplayRules.BuiltInPoiChestRules())
+            {
+                if (rules.Any(x => string.Equals(x.Name, r.Name, StringComparison.Ordinal))) continue;
+                if (insertAt >= 0) rules.Insert(insertAt, r); else rules.Add(r);
+                changed++;
+            }
+
+            if (changed > 0)
+            {
+                _displayRules.Replace(rules);
+                Console.WriteLine($"Display rules: applied {changed} POI/quest-container update(s).");
+            }
+            _settings.PoiChestRulesV1 = true; _settings.Save();
+        }
         // One-time (v2): apply the curated icon glyphs to the STOCK display rules. Names are matched
         // SEPARATOR-INSENSITIVELY (normalized to lowercase alphanumerics) because the stock names contain a
         // "·" whose code point didn't match a literal key in the v1 pass — silently skipping Monster·Unique

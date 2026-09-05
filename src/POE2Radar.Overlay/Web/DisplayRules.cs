@@ -231,16 +231,39 @@ public sealed class DisplayRules
         Cat("Chest · Rare",   "Chest", "Rare",   st.ChestRare);
         Cat("Transition",    "Transition", null,     st.Transition);
 
-        // Object/Other entities the game flags as POIs (waypoints, checkpoints, shrines…).
+        // Entities the game itself flags as POIs (waypoints, checkpoints, shrines, quest corpses…).
+        // CHEST is included deliberately: a quest container like Metadata/Chests/SpireCorpseChest is
+        // category Chest with Poi=true, but is Normal rarity and matches neither StrongBoxes nor
+        // QuestChests — so with Object/Other only it fell through EVERY rule and never drew. This adds
+        // just the game-flagged ones; ordinary chests/pots (Poi=false) are still not drawn.
         rules.Add(new DisplayRule
         {
             Name = "Point of Interest", Enabled = st.Poi.Enabled,
-            Categories = new() { "Object", "Other" }, Poi = "Yes",
+            Categories = new() { "Object", "Other", "Chest" }, Poi = "Yes",
             Shape = st.Poi.Shape, Color = st.Poi.Color, Opacity = st.Poi.Opacity, Size = st.Poi.Size,
         });
 
         return rules;
     }
+
+    /// <summary>
+    /// Quest/POI container rules seeded into every fresh ruleset (and folded into existing configs by a
+    /// one-time migration in <c>RadarApp</c>), for interactables the stock rules miss.
+    /// </summary>
+    public static IEnumerable<DisplayRule> BuiltInPoiChestRules() => new[]
+    {
+        // Lootable quest corpses (e.g. Metadata/Chests/SpireCorpseChest — "Fallen Dekhara" in Deshar).
+        // The generic "Point of Interest" style is a ~3.6px 80%-opacity pin, which is easy to lose among
+        // monster dots, so this gets its own larger, high-contrast marker and is navigable. The label is
+        // deliberately generic: one metadata path covers corpses whose in-game names differ per zone, and
+        // we don't currently read a chest's localized display name.
+        new DisplayRule
+        {
+            Name = "Corpse", Categories = new() { "Chest" }, Match = new() { "CorpseChest" },
+            Shape = "Chest", Color = "#FF66FF", Opacity = 1f, Size = 9f,
+            Label = "Corpse", Navigable = true,
+        },
+    };
 
     /// <summary>
     /// The built-in "auto-track this tile" rules seeded into every fresh ruleset (and folded into existing
