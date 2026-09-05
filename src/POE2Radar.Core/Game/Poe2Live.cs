@@ -908,8 +908,17 @@ public sealed class Poe2Live
     /// toggles. We gate "map open" on a *genuine toggler* — an element observed BOTH visible and
     /// hidden — so a permanently-hidden element can't masquerade as the toggle signal (the bug that
     /// pinned this to "closed" once the UI began exposing 4 elements instead of 2). Projection
-    /// params (shift/zoom) come from a currently-visible toggler. Until the first toggle is observed
-    /// this area, fall back to "more than the always-on baseline visible" (&gt;=2).
+    /// params (shift/zoom) come from a currently-visible toggler.
+    ///
+    /// <para>Until the first toggle is observed this area, fall back to "any element genuinely
+    /// visible" (&gt;=1). That threshold used to be &gt;=2 because visibility was tested with the
+    /// element's LOCAL bit, and one element is permanently local-visible while sitting inside a
+    /// hidden container — it inflated every count by one, so open/closed read as 2/1. Now that
+    /// <see cref="TryReadMapElement"/> tests visibility HIERARCHICALLY that element correctly
+    /// counts as hidden and the same states read 1/0, so &gt;=2 could never be reached and the map
+    /// stayed "closed" until the player toggled it manually (measured live with Research
+    /// <c>--mapdiag --secs</c>). Hierarchical visibility subsumes what the &gt;=2 baseline was
+    /// compensating for; keeping both double-counts the correction.</para>
     /// </summary>
     public MapUi ReadMap(nint inGameState, nint areaInstance)
     {
@@ -924,12 +933,16 @@ public sealed class Poe2Live
 
         var visibleCount = 0;
         var any = false; MapUi anyUi = default;
+        var haveVisibleUi = false; MapUi visibleUi = default;
         var sawToggler = false; var togglerVisible = false; var haveTogglerUi = false; MapUi togglerUi = default;
         foreach (var el in _mapEls)
         {
             if (!TryReadMapElement(el, out var vis, out var sx, out var sy, out var zoom)) continue;
             if (vis) { _everVisible.Add(el); visibleCount++; } else _everHidden.Add(el);
             if (!any) { any = true; anyUi = new MapUi(vis, sx, sy, zoom); }
+            // Prefer a genuinely visible element's projection params in the fallback: the first
+            // element enumerated may be the permanently-hidden one, whose shift/zoom are stale.
+            if (vis && !haveVisibleUi) { visibleUi = new MapUi(true, sx, sy, zoom); haveVisibleUi = true; }
 
             // A genuine toggler has been seen in BOTH states; permanently-on/off elements never qualify.
             if (_everVisible.Contains(el) && _everHidden.Contains(el))
@@ -944,9 +957,11 @@ public sealed class Poe2Live
         if (sawToggler)
             return new MapUi(togglerVisible, togglerUi.ShiftX, togglerUi.ShiftY, togglerUi.Zoom);
 
-        // No toggle observed yet this area: the open minimap lights up one element beyond the
-        // always-on baseline, so >=2 visible ≈ open. Superseded as soon as a real toggle is seen.
-        return new MapUi(visibleCount >= 2, anyUi.ShiftX, anyUi.ShiftY, anyUi.Zoom);
+        // No toggle observed yet this area: with hierarchical visibility, ANY genuinely visible map
+        // element means the map is up (measured: closed = 0, open = 1). Superseded as soon as a
+        // real toggle is seen. Use a visible element's shift/zoom when there is one.
+        var ui = haveVisibleUi ? visibleUi : anyUi;
+        return new MapUi(visibleCount >= 1, ui.ShiftX, ui.ShiftY, ui.Zoom);
     }
 
     private void DiscoverMapElements(nint inGameState)
@@ -998,6 +1013,78 @@ public sealed class Poe2Live
     {
         if (!_reader.TryReadStruct<uint>(element + Poe2.UiElement.Flags, out var flags)) return false;
         return (flags & (1u << Poe2.UiElement.FlagVisibleBit)) != 0;
+    }
+
+    private nint _treePanel;           // cached panel element
+    private nint _treePanelUiRoot;     // the UiRoot it was resolved against
+
+    /// <summary>The passive-tree panel element, or 0 when it can't be identified. Tries the committed
+    /// child index first, then scans UiRoot's children for the unique (fingerprint, child-count) pair so
+    /// an index drift self-heals. See <see cref="Poe2.PassiveTreePanel"/>.</summary>
+    private nint ResolveTreePanel(nint uiRoot)
+    {
+        if (uiRoot == 0) return 0;
+        // Re-validate the cache CHEAPLY: identity + role bits only. Deliberately not the child count —
+        // a panel populating/clearing its children would otherwise invalidate the cache every frame and
+        // send us re-scanning, which can land on a different panel.
+        if (_treePanel != 0 && _treePanelUiRoot == uiRoot && IsPanelShaped(_treePanel)) return _treePanel;
+
+        _treePanel = 0;
+        _treePanelUiRoot = uiRoot;
+
+        var begin = Ptr(uiRoot + Poe2.UiElement.Children);
+        var end   = Ptr(uiRoot + Poe2.UiElement.ChildrenEnd);
+        if (begin == 0 || end <= begin) return 0;
+        var n = (int)((end - begin) / 8);
+        if (n is <= 0 or > 4096) return 0;
+
+        if (Poe2.PassiveTreePanel.UiRootChildIndex < n)
+        {
+            var el = Ptr(begin + (nint)(Poe2.PassiveTreePanel.UiRootChildIndex * 8));
+            if (MatchesTreePanel(el)) return _treePanel = el;
+        }
+
+        // Self-heal: exactly one child matching (fingerprint, child count). Ambiguity ⇒ give up so the
+        // caller fails open, rather than gating rendering on a guess.
+        nint found = 0;
+        for (var i = 0; i < n; i++)
+        {
+            var el = Ptr(begin + (nint)(i * 8));
+            if (!MatchesTreePanel(el)) continue;
+            if (found != 0) return 0;
+            found = el;
+        }
+        return _treePanel = found;
+    }
+
+    private bool IsPanelShaped(nint el)
+    {
+        if (el == 0 || Ptr(el + Poe2.UiElement.Self) != el) return false;
+        if (!_reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var fl)) return false;
+        return (fl & ~(1u << Poe2.UiElement.FlagVisibleBit)) == Poe2.PassiveTreePanel.Fingerprint;
+    }
+
+    private bool MatchesTreePanel(nint el)
+    {
+        if (!IsPanelShaped(el)) return false;
+        var b = Ptr(el + Poe2.UiElement.Children);
+        var e = Ptr(el + Poe2.UiElement.ChildrenEnd);
+        var kids = b != 0 && e > b ? (int)((e - b) / 8) : 0;
+        return kids == Poe2.PassiveTreePanel.ExpectedChildCount;
+    }
+
+    /// <summary>True while the passive skill tree is open (its panel's visible bit is SET), so
+    /// world-anchored overlays should not draw on top of it.
+    ///
+    /// <para><b>Fails open.</b> If the panel can't be identified — index drifted AND the
+    /// (fingerprint, child-count) key became ambiguous — this returns false ("tree not open"), so a
+    /// future patch degrades to drawing as before rather than silently blanking the overlay.</para></summary>
+    public bool IsPassiveTreeOpen(nint inGameState)
+    {
+        var panel = ResolveTreePanel(Ptr(inGameState + Poe2.InGameState.UiRoot));
+        if (panel == 0) return false;                                 // unidentifiable → fail open
+        if (!_reader.TryReadStruct<uint>(panel + Poe2.UiElement.Flags, out var fl)) return false;
+        return (fl & (1u << Poe2.UiElement.FlagVisibleBit)) != 0;     // panel VISIBLE ⇒ tree open
     }
 
     /// <summary>True iff the element AND every ancestor (via Parent <c>+0xB8</c>) have the visible bit

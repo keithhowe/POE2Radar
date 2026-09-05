@@ -684,4 +684,32 @@ public static class Poe2
         public static readonly int WorldTracker = OffsetOverrides.Get("HoverTracker.WorldTracker", 0x630); // + 0x630 → world hover tracker
         public static readonly int HoveredEntity = OffsetOverrides.Get("HoverTracker.HoveredEntity", 0x18); // + 0x18 → hovered entity/element
     }
+
+    /// <summary>The passive skill tree screen — a persistent direct child of UiRoot whose visible bit is
+    /// SET while the tree is open, exactly like <see cref="AtlasPanel"/>. Used to suppress the radar
+    /// while the tree covers the world.
+    ///
+    /// <para><b>Polarity (validated 2026-09-04, one state per measurement):</b> tree CLOSED → hidden,
+    /// tree OPEN → visible. This is a PANEL, not a HUD layer. Reading it the other way round (treating
+    /// "hidden" as "a panel is covering the world") inverts the gate: the radar is then suppressed
+    /// during normal play and drawn on top of the tree — the exact symptom that behaviour produced.</para>
+    ///
+    /// <para><b>Why not hierarchical visibility on the map element.</b> Measured with Research
+    /// <c>--mapdiag --secs</c>: toggling the tree produces ZERO change to the map elements' own or
+    /// ancestor visible bits — the map UI and this panel are SIBLINGS, so no parent walk can see it.
+    /// The ground-label layer (UiRoot child[8]) is likewise unaffected.</para>
+    ///
+    /// <para><b>Identification.</b> <see cref="Fingerprint"/> alone is NOT unique — 5 of 124 UiRoot
+    /// children share it (22/24/25/29/64), because they are all screen panels; 22 is the
+    /// <see cref="AtlasPanel"/>. Their child counts are 18/8/9/10/13, so
+    /// (fingerprint, <see cref="ExpectedChildCount"/>) is a unique key and the gate self-heals when the
+    /// index drifts. <see cref="UiRootChildIndex"/> is only a fast path. Re-derive after a patch with
+    /// Research <c>--uitoggle</c>, and confirm polarity with <c>--huddiag</c> in each state separately —
+    /// never from a single toggle-while-watching run, which cannot tell you which state was which.</para></summary>
+    public static class PassiveTreePanel
+    {
+        public static readonly int UiRootChildIndex   = OffsetOverrides.Get("PassiveTreePanel.UiRootChildIndex", 24);   // fast path; validated before use
+        public static readonly int ExpectedChildCount = OffsetOverrides.Get("PassiveTreePanel.ExpectedChildCount", 8);  // disambiguates from the other panels
+        public static readonly uint Fingerprint       = OffsetOverrides.Get("PassiveTreePanel.Fingerprint", 0x005626F5u); // Flags with the visible bit masked out
+    }
 }

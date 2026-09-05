@@ -207,6 +207,12 @@ if (HasFlag(args, "--areascan"))
 if (HasFlag(args, "--uitoggle"))
     return RunUiToggle(process, reader, TryGetIntArg(args, "--secs") ?? 12);
 
+if (HasFlag(args, "--mapdiag"))
+    return RunMapDiag(process, reader, TryGetIntArg(args, "--secs") ?? 0);
+
+if (HasFlag(args, "--huddiag"))
+    return RunHudDiag(process, reader, TryGetIntArg(args, "--secs") ?? 0);
+
 if (HasFlag(args, "--presence"))
     return RunPresence(process, reader, HasFlag(args, "--diff"));
 
@@ -1788,6 +1794,224 @@ static int RunAreaScan(ProcessHandle process, MemoryReader reader)
             Console.WriteLine($"    {nm,-13} @0x{o:X3}  {cur}/{max}  {(sane ? "OK" : "** implausible -> drifted (run --vitals) **")}");
         }
 
+    return 0;
+}
+
+// ── HUD-layer diagnostic ─────────────────────────────────────────────────────────────────
+// The map elements are NOT descendants of whatever the passive tree hides, so hierarchical
+// visibility on them can't detect a full-screen panel. This probe tests the alternative anchor:
+// the ground-label layer (ItemsOnGroundLabelElement) is resolved STRUCTURALLY by flags
+// fingerprint — no child index — and is part of the in-game HUD, so if IT hides with the panel
+// we get an index-free gate. Prints its ancestor chain to UiRoot with each visible bit, then
+// watches for changes while the user toggles a panel.
+static int RunHudDiag(ProcessHandle process, MemoryReader reader, int watchSecs)
+{
+    nint slot = 0;
+    foreach (var pat in AobPatterns.GameStateRefs)
+    {
+        foreach (var s in AobScanner.ScanForResolvedAddresses(process, reader, pat).Distinct())
+            if (new Poe2Live(reader, s).TryResolve(out _, out _, out _)) { slot = s; break; }
+        if (slot != 0) break;
+    }
+    if (slot == 0) { Console.Error.WriteLine("Could not lock GameState slot (in game?)."); return 1; }
+
+    var live = new Poe2Live(reader, slot);
+    if (!live.TryResolve(out var igs, out _, out _)) { Console.Error.WriteLine("chain not resolved"); return 1; }
+
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
+    var container = live.ResolveGroundLabelContainer(igs);
+    Console.WriteLine($"UiRoot 0x{uiRoot:X}   groundLabelContainer 0x{container:X}");
+    if (container == 0) { Console.Error.WriteLine("ground-label container not resolved — can't test this anchor."); return 1; }
+
+    // Index every direct child of UiRoot so the chain can be labelled.
+    var idxOf = new Dictionary<nint, int>();
+    var cb = SafePtr(reader, uiRoot + Poe2.UiElement.Children);
+    var ce = SafePtr(reader, uiRoot + Poe2.UiElement.ChildrenEnd);
+    if (cb != 0 && ce > cb)
+        for (var i = 0; i < (int)((ce - cb) / 8); i++)
+        {
+            var el = SafePtr(reader, cb + (nint)(i * 8));
+            if (el != 0) idxOf[el] = i;
+        }
+
+    var chain = new List<nint>();
+    var cur = container;
+    while (cur != 0 && chain.Count < 32)
+    {
+        chain.Add(cur);
+        var p = SafePtr(reader, cur + Poe2.UiElement.Parent);
+        if (p == cur || p == 0) break;
+        cur = p;
+    }
+
+    var visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+    bool Vis(nint el) => reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var f) && (f & visBit) != 0;
+
+    Console.WriteLine("\nancestor chain (container -> root):");
+    foreach (var el in chain)
+    {
+        var tag = idxOf.TryGetValue(el, out var ix) ? $"  <== UiRoot child[{ix}]" : "";
+        reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var fl);
+        Console.WriteLine($"  0x{el:X}  vis={(Vis(el) ? "VIS" : "hid")}  flags=0x{fl:X8}{tag}");
+    }
+
+    // Can the HUD container be pinned WITHOUT a child index? Its Flags fingerprint alone matched 5
+    // of 124 children, so list every candidate with its child count to see whether
+    // (fingerprint, childCount) is a unique key. If it is, the gate self-heals across index drift.
+    Console.WriteLine("\nUiRoot children sharing the HUD fingerprint 0x005626F5 (visible bit masked):");
+    const uint hudFp = 0x005626F5;
+    var vmask = 1u << Poe2.UiElement.FlagVisibleBit;
+    var cands = 0;
+    foreach (var kv in idxOf.OrderBy(k => k.Value))
+    {
+        if (!reader.TryReadStruct<uint>(kv.Key + Poe2.UiElement.Flags, out var fl)) continue;
+        if ((fl & ~vmask) != hudFp) continue;
+        var kb = SafePtr(reader, kv.Key + Poe2.UiElement.Children);
+        var ke = SafePtr(reader, kv.Key + Poe2.UiElement.ChildrenEnd);
+        var kn = kb != 0 && ke > kb ? (int)((ke - kb) / 8) : 0;
+        cands++;
+        Console.WriteLine($"  child[{kv.Value,3}] 0x{kv.Key:X}  children={kn,-4} vis={((fl & vmask) != 0 ? "VIS" : "hid")}");
+    }
+    Console.WriteLine($"  ({cands} candidate(s) — a unique children= value would key the gate without an index)");
+
+    if (watchSecs <= 0) return 0;
+
+    Console.WriteLine($"\n>>> WATCHING {watchSecs}s — toggle the PASSIVE TREE now. Printing only on change.\n");
+
+    // Track every fingerprint candidate's (index, childCount, visible) so instability in the
+    // child-count key shows up: if a count flickers, the "unique" key is not actually unique
+    // over time and any gate built on it will oscillate.
+    string CandSig()
+    {
+        var parts = new List<string>();
+        foreach (var kv in idxOf.OrderBy(k => k.Value))
+        {
+            if (!reader.TryReadStruct<uint>(kv.Key + Poe2.UiElement.Flags, out var fl)) continue;
+            if ((fl & ~vmask) != hudFp) continue;
+            var kb = SafePtr(reader, kv.Key + Poe2.UiElement.Children);
+            var ke = SafePtr(reader, kv.Key + Poe2.UiElement.ChildrenEnd);
+            var kn = kb != 0 && ke > kb ? (int)((ke - kb) / 8) : 0;
+            parts.Add($"{kv.Value}:{kn}:{((fl & vmask) != 0 ? "V" : "-")}");
+        }
+        return string.Join(" ", parts);
+    }
+
+    string Sig() => string.Concat(chain.Select(el => Vis(el) ? 'V' : '-')) + "  |  " + CandSig();
+    var last = Sig();
+    Console.WriteLine($"  [ 0.0s] {last}");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var changes = 0;
+    while (sw.Elapsed.TotalSeconds < watchSecs)
+    {
+        Thread.Sleep(150);
+        var s2 = Sig();
+        if (s2 == last) continue;
+        last = s2; changes++;
+        Console.WriteLine($"  [{sw.Elapsed.TotalSeconds,5:F1}s] {s2}");
+    }
+    Console.WriteLine($"\n  {changes} change(s). Chain order is container-first, root-last.");
+    if (changes == 0) Console.WriteLine("  NOTHING moved — this anchor can't detect the panel either.");
+    return 0;
+}
+
+// ── Map-element visibility diagnostic ────────────────────────────────────────────────────
+// Per map element (DefaultShift == (0,-20)), prints its LOCAL visible bit, its HIERARCHICAL
+// visibility, and the first ancestor that is hidden. ReadMap's pre-toggle fallback counts
+// visible elements against a threshold, so a change in what "visible" means shifts that count --
+// run this with the map CLOSED and again with it OPEN to see the real numbers.
+static int RunMapDiag(ProcessHandle process, MemoryReader reader, int watchSecs = 0)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
+    if (uiRoot == 0) { Console.Error.WriteLine("No UiRoot."); return 1; }
+
+    var visBit = 1u << Poe2.UiElement.FlagVisibleBit;
+    bool LocalVis(nint el) => reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var f) && (f & visBit) != 0;
+
+    // First hidden ancestor (0 = none: hierarchically visible).
+    nint FirstHiddenAncestor(nint el)
+    {
+        var cur = SafePtr(reader, el + Poe2.UiElement.Parent);
+        for (var i = 0; i < 32 && cur != 0; i++)
+        {
+            if (!reader.TryReadStruct<uint>(cur + Poe2.UiElement.Flags, out var f)) return 0;
+            if ((f & visBit) == 0) return cur;
+            var par = SafePtr(reader, cur + Poe2.UiElement.Parent);
+            if (par == cur || par == 0) break;
+            cur = par;
+        }
+        return 0;
+    }
+
+    // BFS for the map elements, same signature Poe2Live.DiscoverMapElements uses.
+    var els = new List<nint>();
+    var q = new Queue<nint>(); q.Enqueue(uiRoot);
+    var seen = new HashSet<nint>();
+    while (q.Count > 0 && seen.Count < 40000)
+    {
+        var el = q.Dequeue();
+        if (el == 0 || !seen.Add(el)) continue;
+        var b = SafePtr(reader, el + Poe2.UiElement.Children);
+        var e2 = SafePtr(reader, el + Poe2.UiElement.ChildrenEnd);
+        if (b != 0 && e2 > b && (e2 - b) < 0x10000)
+            for (var p = b; p < e2; p += 8) q.Enqueue(SafePtr(reader, p));
+        if (reader.TryReadStruct<float>(el + Poe2.MapUiElement.DefaultShift + 4, out var dsy) && dsy == -20f)
+            els.Add(el);
+    }
+
+    Console.WriteLine($"UiRoot 0x{uiRoot:X}   map elements found: {els.Count}\n");
+    int localCount = 0, hierCount = 0;
+    foreach (var el in els)
+    {
+        var lv = LocalVis(el);
+        var hidden = FirstHiddenAncestor(el);
+        var hv = lv && hidden == 0;
+        if (lv) localCount++;
+        if (hv) hierCount++;
+        reader.TryReadStruct<float>(el + Poe2.MapUiElement.Zoom, out var zoom);
+        Console.WriteLine($"  0x{el:X}  local={(lv ? "VIS" : "hid")}  hierarchical={(hv ? "VIS" : "hid")}  zoom={zoom:F2}"
+                        + (hidden != 0 ? $"   firstHiddenAncestor=0x{hidden:X}" : ""));
+    }
+    Console.WriteLine($"\n  visible by LOCAL bit        : {localCount}");
+    Console.WriteLine($"  visible HIERARCHICALLY      : {hierCount}");
+    Console.WriteLine("  ReadMap's pre-toggle fallback treats '>= 2 visible' as map-open.");
+
+    if (watchSecs <= 0) return 0;
+
+    // Two static samples can't prove anything if the toggle happened outside the sampling
+    // instants. Poll and print only on CHANGE, so whatever the map toggle actually moves shows
+    // up regardless of timing -- including elements whose LOCAL bit never moves.
+    Console.WriteLine($"\n>>> WATCHING {watchSecs}s — toggle the map / minimap now. Printing only on change.\n");
+    string Signature()
+    {
+        var parts = els.Select(el =>
+        {
+            var lv = LocalVis(el);
+            var hv = lv && FirstHiddenAncestor(el) == 0;
+            return $"{(lv ? 'L' : '-')}{(hv ? 'H' : '-')}";
+        });
+        return string.Join(" ", parts);
+    }
+
+    var last = Signature();
+    Console.WriteLine($"  [ 0.0s] {last}   (L=local bit, H=hierarchically visible)");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var changes = 0;
+    while (sw.Elapsed.TotalSeconds < watchSecs)
+    {
+        Thread.Sleep(150);
+        var sig = Signature();
+        if (sig == last) continue;
+        last = sig;
+        changes++;
+        var hv = els.Count(el => LocalVis(el) && FirstHiddenAncestor(el) == 0);
+        var lv2 = els.Count(LocalVis);
+        Console.WriteLine($"  [{sw.Elapsed.TotalSeconds,5:F1}s] {sig}   localVisible={lv2}  hierVisible={hv}");
+    }
+    Console.WriteLine($"\n  {changes} change(s) observed.");
+    if (changes == 0)
+        Console.WriteLine("  NOTHING moved — the map toggle does not affect these elements at all.");
     return 0;
 }
 

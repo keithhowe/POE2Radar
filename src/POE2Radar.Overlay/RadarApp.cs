@@ -1102,6 +1102,11 @@ public sealed class RadarApp : IDisposable
             player = _liveRender.PlayerGrid(localPlayer) ?? NumVec2.Zero;
             playerWorld = _liveRender.PlayerWorld(localPlayer);   // same Render read PlayerGrid uses; live each frame
             map = _liveRender.ReadMap(inGameState, areaInstance);
+            // The passive tree covers the world while leaving the map UI element visible, so the map's
+            // own state can't detect it — treat the map as closed while the tree is up. Gated on the
+            // tree panel being VISIBLE (it is a panel, not a HUD layer; the inverse reads backwards).
+            if (map.IsVisible && _liveRender.IsPassiveTreeOpen(inGameState))
+                map = map with { IsVisible = false };
             // Player name reads a StdWString (allocates a string) — read it only when the local-player
             // pointer changes (i.e. once per session), not every render frame.
             if (localPlayer != _charNameFor) { _charNameFor = localPlayer; _charName = _liveRender.PlayerName(localPlayer); }
