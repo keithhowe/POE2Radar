@@ -1425,8 +1425,10 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
     Win.GetClientRect(Win.GetForegroundWindow(), out var rc);
     int W = rc.right - rc.left, H = rc.bottom - rc.top;
     if (W <= 0) { W = 1920; H = 1080; }
-    var cam368 = SafePtr(reader, igs + 0x368);
-    Console.WriteLine($"InGameState 0x{igs:X}  Camera(*+0x368) 0x{cam368:X}  player world=({w.X:F1},{w.Y:F1},{w.Z:F1})  window={W}x{H}");
+    // Track the committed constant: the hard-coded 0x368 went stale in the 2026-09-04 patch and
+    // made this read null, so the scan below never even looked at the real Camera object.
+    var camObj = SafePtr(reader, igs + Poe2.InGameState.Camera);
+    Console.WriteLine($"InGameState 0x{igs:X}  Camera(*+0x{Poe2.InGameState.Camera:X}) 0x{camObj:X}  player world=({w.X:F1},{w.Y:F1},{w.Z:F1})  window={W}x{H}");
     var monsters = new List<POE2Radar.Core.Game.Vector3>();
     var head = SafePtr(reader, ai + Poe2.AreaInstance.AwakeEntities);
     if (head != 0)
@@ -1456,15 +1458,17 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
         return ((cx/cw/2f + 0.5f) * W, (0.5f - cy/cw/2f) * H, cw);
     }
 
-    // Zoom per the community note (Camera+0x528) — a sanity readout.
-    if (cam368 != 0 && reader.TryReadStruct<float>(cam368 + 0x528, out var zoom)) Console.WriteLine($"  Camera.Zoom(*+0x528) = {zoom}");
+    // Zoom sanity readout off the resolved Camera object.
+    if (camObj != 0 && reader.TryReadStruct<float>(camObj + Poe2.Camera.Zoom, out var zoom))
+        Console.WriteLine($"  Camera.Zoom(*+0x{Poe2.Camera.Zoom:X}) = {zoom}  (expect 1.0)");
 
-    // Scan candidate camera objects: the +0x368 camera first, then any pointer in InGameState.
+    // Scan candidate camera objects: the resolved Camera first, then any pointer in InGameState.
     var objs = new List<(string label, nint addr)>();
-    if (cam368 != 0) objs.Add(("Camera+0x368", cam368));
-    for (var o = 0; o < 0x600; o += 8) { var p = SafePtr(reader, igs + o); if (p != 0 && p != cam368) objs.Add(($"IGS+0x{o:X3}", p)); }
+    if (camObj != 0) objs.Add(($"Camera+0x{Poe2.InGameState.Camera:X}", camObj));
+    for (var o = 0; o < 0x600; o += 8) { var p = SafePtr(reader, igs + o); if (p != 0 && p != camObj) objs.Add(($"IGS+0x{o:X3}", p)); }
 
     var buf = new byte[0x600];
+    var degenerate = 0;
     foreach (var (label, cam) in objs)
     {
         if (reader.TryReadBytes(cam, buf) < buf.Length) continue;
@@ -1486,10 +1490,17 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
             // spreadX = how far apart monsters land horizontally — a real projection spreads them; a
             // degenerate one stacks them near center.
             var spread = on > 1 ? (int)(maxx - minx) : 0;
+            // A degenerate matrix collapses every monster onto the player's point: it satisfies
+            // "player near centre" and "all on screen" while being useless. Requiring real
+            // horizontal spread is what separates a true projection from that noise.
+            if (monsters.Count > 1 && spread < 40) { degenerate++; continue; }
             Console.WriteLine($"  {label} (0x{cam:X}) matrix@+0x{mo:X3} -> player=({sx:F0},{sy:F0}) w={cw:F1}  onScreen={on}/{monsters.Count} spreadX={spread}");
         }
     }
-    Console.WriteLine("Real W2S: from the Camera+0x368 object, player≈center, all monsters on-screen, and a healthy spreadX.");
+    Console.WriteLine($"\n({degenerate} degenerate candidate(s) suppressed — they collapsed every monster onto one point.)");
+    Console.WriteLine($"Real W2S: from the Camera object (InGameState+0x{Poe2.InGameState.Camera:X}), player≈center, "
+                    + "all monsters on-screen, and a healthy spreadX.");
+    Console.WriteLine($"Committed Camera.WorldToScreenMatrix = +0x{Poe2.Camera.WorldToScreenMatrix:X}.");
     return 0;
 }
 
