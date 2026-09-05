@@ -424,3 +424,14 @@ POE2Radar-*-win-x64.zip
 # local-only scratch + reference material (community notes, third-party dumps)
 resources/
 
+# Pasted screenshots / local captures. Anchored to the repo ROOT on purpose: a bare *.png
+# would also cover src/POE2Radar.Overlay/Assets/AtlasIcons/*.png, which ARE tracked.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.mp4
+/screenshots/
+/captures/
+
