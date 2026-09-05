@@ -204,6 +204,9 @@ if (HasFlag(args, "--info"))
 if (HasFlag(args, "--areascan"))
     return RunAreaScan(process, reader);
 
+if (HasFlag(args, "--uitoggle"))
+    return RunUiToggle(process, reader, TryGetIntArg(args, "--secs") ?? 12);
+
 if (HasFlag(args, "--presence"))
     return RunPresence(process, reader, HasFlag(args, "--diff"));
 
@@ -1785,6 +1788,89 @@ static int RunAreaScan(ProcessHandle process, MemoryReader reader)
             Console.WriteLine($"    {nm,-13} @0x{o:X3}  {cur}/{max}  {(sane ? "OK" : "** implausible -> drifted (run --vitals) **")}");
         }
 
+    return 0;
+}
+
+// ── Find the UiRoot child that gates a full-screen panel (passive tree, atlas, …) ────────
+// Snapshots every direct child of UiRoot, waits while the user opens the panel, then reports
+// which children's VISIBLE bit flipped. That element is the panel's open-gate. Also prints the
+// Flags fingerprint (visible bit masked out) so the gate can be matched by ROLE BITS rather than
+// by child index — indices drift per patch, the role bits don't (same idea as the Runeforge and
+// GroundLabels fingerprints).
+static int RunUiToggle(ProcessHandle process, MemoryReader reader, int seconds)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
+    if (uiRoot == 0) { Console.Error.WriteLine("No UiRoot."); return 1; }
+
+    List<(int idx, nint el, uint flags)> Snap()
+    {
+        var list = new List<(int, nint, uint)>();
+        var begin = SafePtr(reader, uiRoot + Poe2.UiElement.Children);
+        var end   = SafePtr(reader, uiRoot + Poe2.UiElement.ChildrenEnd);
+        if (begin == 0 || end <= begin) return list;
+        var n = (int)((end - begin) / 8);
+        for (var i = 0; i < Math.Min(n, 256); i++)
+        {
+            var el = SafePtr(reader, begin + (nint)(i * 8));
+            if (el == 0 || SafePtr(reader, el + Poe2.UiElement.Self) != el) continue;
+            if (!reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var fl)) continue;
+            list.Add((i, el, fl));
+        }
+        return list;
+    }
+
+    static uint VisBit(uint fl) => (fl >> Poe2.UiElement.FlagVisibleBit) & 1;
+
+    Console.WriteLine($"UiRoot 0x{uiRoot:X}");
+    Console.WriteLine("Make sure the panel is CLOSED. Snapshotting in 3s…");
+    Thread.Sleep(3000);
+    var before = Snap();
+    Console.WriteLine($"  baseline: {before.Count} direct children");
+
+    Console.WriteLine($"\n>>> NOW OPEN THE PANEL (passive tree) and KEEP IT OPEN. Sampling in {seconds}s…");
+    for (var i = seconds; i > 0; i--) { Console.Write($"\r  {i}s  "); Thread.Sleep(1000); }
+    Console.WriteLine();
+    var after = Snap();
+
+    var beforeByEl = before.ToDictionary(x => x.el, x => x);
+    var changed = 0;
+    Console.WriteLine("\n=== children whose VISIBLE bit flipped (candidate open-gates) ===");
+    foreach (var a in after)
+    {
+        if (!beforeByEl.TryGetValue(a.el, out var b)) continue;
+        if (VisBit(b.flags) == VisBit(a.flags)) continue;
+        changed++;
+        var dir = VisBit(a.flags) == 1 ? "HIDDEN -> VISIBLE" : "VISIBLE -> HIDDEN";
+        Console.WriteLine($"  child[{a.idx}] 0x{a.el:X}  {dir}");
+        Console.WriteLine($"      flags 0x{b.flags:X8} -> 0x{a.flags:X8}   fingerprint(no visible bit) = 0x{a.flags & ~(1u << Poe2.UiElement.FlagVisibleBit):X8}");
+        var kids = SafePtr(reader, a.el + Poe2.UiElement.Children);
+        var kidsEnd = SafePtr(reader, a.el + Poe2.UiElement.ChildrenEnd);
+        var kn = kids != 0 && kidsEnd > kids ? (kidsEnd - kids) / 8 : 0;
+        Console.WriteLine($"      children={kn}");
+    }
+    if (changed == 0)
+        Console.WriteLine("  none — the panel may not be a DIRECT UiRoot child, or it was already open at baseline.");
+
+    // Is the fingerprint UNIQUE among UiRoot's children? If so the gate can be found by role bits
+    // and survives index drift; if not, the index is the only usable key and must be re-checked
+    // per patch (the trap AtlasPanel.UiRootChildIndex already sits in).
+    const uint visMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    foreach (var a in after)
+    {
+        if (!beforeByEl.TryGetValue(a.el, out var b) || VisBit(b.flags) == VisBit(a.flags)) continue;
+        var fp = a.flags & ~visMask;
+        var matches = after.Where(x => (x.flags & ~visMask) == fp).Select(x => x.idx).ToList();
+        Console.WriteLine($"\n  fingerprint 0x{fp:X8} matches {matches.Count} of {after.Count} children: [{string.Join(", ", matches)}]");
+        Console.WriteLine(matches.Count == 1
+            ? "  UNIQUE — safe to locate this gate by fingerprint instead of by child index."
+            : "  NOT unique — index or a further discriminator (child count) is needed.");
+    }
+
+    // Elements that appeared/disappeared entirely are also worth knowing about.
+    var newEls = after.Select(a => a.el).Except(before.Select(b => b.el)).ToList();
+    if (newEls.Count > 0) Console.WriteLine($"\n{newEls.Count} child element(s) were REPLACED between snapshots (address churn).");
     return 0;
 }
 

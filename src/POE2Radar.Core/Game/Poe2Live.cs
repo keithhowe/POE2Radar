@@ -985,15 +985,47 @@ public sealed class Poe2Live
         _reader.TryReadStruct<float>(el + Poe2.MapUiElement.Shift, out shiftX);
         _reader.TryReadStruct<float>(el + Poe2.MapUiElement.Shift + 4, out shiftY);
         _reader.TryReadStruct<float>(el + Poe2.MapUiElement.Zoom, out zoom);
-        visible = IsVisible(el);
+        // Hierarchical on purpose: a full-screen panel (passive tree, character screen) hides an
+        // ANCESTOR container while this element's own bit stays set, which used to leave the radar
+        // drawing on top of the tree.
+        visible = IsVisibleHierarchical(el);
         return true;
     }
 
-    /// <summary>Element's own visibility bit (0x0B of Flags). Note: full visibility is hierarchical.</summary>
+    /// <summary>Element's own visibility bit (0x0B of Flags). Note: full visibility is hierarchical —
+    /// use <see cref="IsVisibleHierarchical"/> when you need "is this actually on screen".</summary>
     public bool IsVisible(nint element)
     {
         if (!_reader.TryReadStruct<uint>(element + Poe2.UiElement.Flags, out var flags)) return false;
         return (flags & (1u << Poe2.UiElement.FlagVisibleBit)) != 0;
+    }
+
+    /// <summary>True iff the element AND every ancestor (via Parent <c>+0xB8</c>) have the visible bit
+    /// set — i.e. it is genuinely on screen.
+    ///
+    /// <para>The game hides a full-screen panel's backdrop by clearing the visible bit on a high-level
+    /// CONTAINER, not on each leaf: opening the passive tree flips one UiRoot child (observed live via
+    /// Research <c>--uitoggle</c>) while the map element's own bit stays set. Checking only the local bit
+    /// therefore reports "map open" while the passive tree / character screen covers the game.</para>
+    ///
+    /// <para><b>Fail-open on ancestors.</b> If an ancestor's flags can't be read (a drifted Parent
+    /// offset, a freed element) this returns true rather than false, so a future patch degrades to the
+    /// old local-bit behaviour instead of silently pinning the overlay to "never draw".</para></summary>
+    public bool IsVisibleHierarchical(nint element, int maxDepth = 32)
+    {
+        if (element == 0) return false;
+        if (!IsVisible(element)) return false;               // own bit: strict
+
+        var cur = Ptr(element + Poe2.UiElement.Parent);
+        for (var i = 0; i < maxDepth && cur != 0; i++)
+        {
+            if (!_reader.TryReadStruct<uint>(cur + Poe2.UiElement.Flags, out var flags)) return true; // fail-open
+            if ((flags & (1u << Poe2.UiElement.FlagVisibleBit)) == 0) return false;
+            var parent = Ptr(cur + Poe2.UiElement.Parent);
+            if (parent == cur || parent == 0) break;          // reached the root
+            cur = parent;
+        }
+        return true;
     }
 
     // ── UiElement screen geometry (GameHelper UiElementBase port; shared with Poe2Runeforge) ──────────
