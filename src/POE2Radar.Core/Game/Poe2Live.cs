@@ -150,9 +150,22 @@ public sealed class Poe2Live
         if (areaInstance == _areaCodeFor) return _areaCode;
         _areaCodeFor = areaInstance;
         var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
-        var s = Ptr(info);
+        var s = Ptr(info + Poe2.AreaInfo.Code);
         _areaCode = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
         return _areaCode;
+    }
+
+    private string _areaName = ""; private nint _areaNameFor = -1;
+
+    /// <summary>Area display name (e.g. "Clearfell Encampment"). Cached per area.</summary>
+    public string AreaName(nint areaInstance)
+    {
+        if (areaInstance == _areaNameFor) return _areaName;
+        _areaNameFor = areaInstance;
+        var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
+        var s = Ptr(info + Poe2.AreaInfo.Name);
+        _areaName = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
+        return _areaName;
     }
 
     private string _league = ""; private nint _leagueFor = -1;

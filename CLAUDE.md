@@ -109,28 +109,50 @@ is rescaled by liveZoom/calibZoom each frame. See `resources/atlas-research-note
 
 ## Key facts (validated live; re-verify per patch)
 
-- Chain: AOB "Game States" → GameState → InGameState (active state) → `AreaInstance @ +0x290` →
-  `LocalPlayer @ +0x5B8`.
-- AreaInstance: AreaInfo `+0xA0` (code), AreaLevel `+0xC4`, AreaHash `+0x11C`, AwakeEntities std::map
-  `+0x6D8` / Sleeping `+0x6E8`, TerrainStruct `+0x8B8` (walkable `+0xD0`, BytesPerRow `+0x130`). The
-  entity-map/player/terrain/ServerData block shifted +0x18 in the 2026-06-25 patch (validated live).
-- Entity: Details `+0x08`, ComponentList `+0x10`; component map via ComponentLookUp StdBucket.
-  Rarity = ObjectMagicProperties `+0x144`; hostility = Positioned.Reaction `+0x1E0` (friendly = bit
-  pattern `(b&0x7F)==1`); grid = Render world `+0x138` / 10.87; Life HP `+0x1A8` / Mana `+0x1F8` / ES
-  `+0x230`; Player name `+0x1B0`, level `+0x204`.
-- Map UI: UiRoot `InGameState +0x2F0`; UiElement Self `+0x08`, Children `+0x10`, Flags `+0x180`
-  (visible = bit `0x0B`); MapUiElement Shift `+0x368`, DefaultShift `+0x370` (= (0,-20)), Zoom `+0x3A8`.
-- Inventory (✓ live, Research `--inventory`): `AreaInstance +0x598` → ServerData → `+0x48` PlayerServerData
+- Chain: AOB "Game States" → GameState → InGameState (active state) → `AreaInstance @ +0x2A0` →
+  `LocalPlayer @ +0x5D0`. UiRoot `InGameState +0x300`; Camera `+0x378`; MouseOver host `+0x310`.
+- AreaInstance: AreaInfo `+0x98` → WorldAreas row (Code `+0x00`, Name `+0x08`, both raw UTF-16
+  pointers — not a single blob), AreaLevel `+0xBC`, AreaHash `+0x114`, AwakeEntities std::map
+  `+0x6F0` / Sleeping `+0x700`, TerrainStruct `+0x8D0` (inline, not a pointer; walkable `+0xD0`,
+  BytesPerRow `+0x130`). **This struct does NOT move as one block** — the header (AreaInfo/Level/
+  Hash) and the late block (ServerData/LocalPlayer/entity maps/terrain) can shift in OPPOSITE
+  directions in the same patch (2026-09-05 league patch: header -0x08, late block +0x10). Re-derive
+  each field independently; never extrapolate one field's delta onto another.
+- Entity: Details `+0x08`, ComponentList `+0x10`, Id `+0x88`, IsValid `+0x8C`; component map via
+  ComponentLookUp StdBucket. Rarity = ObjectMagicProperties `+0x144`; hostility =
+  Positioned.Reaction `+0x1E0` (friendly = bit pattern `(b&0x7F)==1`); grid = Render world `+0x138`
+  / 10.87; Life HP `+0x1A8` / Mana `+0x1F8` / ES `+0x230`; Player name `+0x1B0`, level `+0x204`.
+- Map UI: UiElement Self `+0x08`, Children `+0x10`, Parent `+0xB8` (all UNCHANGED since 2026-06)
+  but everything else drifts independently per patch — Flags `+0x168` (visible = bit `0x0B`),
+  RelativePos `+0x100`, LocalScaleMul `+0x118`, PositionModifier `+0x108`, ScaleIndex `+0x172`,
+  SizeW/H `+0x270`/`+0x274`, Text `+0x360`. MapUiElement Shift `+0x350`, DefaultShift `+0x358`
+  (= (0,-20)), Zoom `+0x390`. Never assume one uniform class shift — re-derive each field with
+  `--areascan`/`--ui-textscan` and diff against the committed value.
+- Inventory (✓ live, Research `--inventory`): `AreaInstance +0x5B0` → ServerData → `+0x48` PlayerServerData
   vec `[0]` → ServerDataStructure → `+0x320` PlayerInventories vec (InventoryArrayStruct stride `0x18`:
-  `+0x00` id, `+0x08` → InventoryStruct, `+0x10` = ptr−0x10 fingerprint). ServerData `+0x21E0` =
-  std::wstring **current league name** (✓ live 2026-06-22, Research `--league`) — verbatim
+  `+0x00` id, `+0x08` → InventoryStruct, `+0x10` = ptr−0x10 fingerprint). ServerData `+0x2160` =
+  std::wstring **current league name** (✓ live, Research `--league`) — verbatim
   poe.ninja/poe2scout `Value` incl. the "HC " prefix (e.g. "HC Runes of Aldur"), so it auto-detects the
   HC vs SC price league. InventoryStruct: TotalBoxes(X,Y)
   `+0x150`, ItemList vec(ptr→InventoryItemStruct, len X·Y) `+0x170`. InventoryItemStruct: Item entity
   `+0x00`, Slot `+0x08`. Item = Entity; Mods rarity `+0x94`/identified `+0x90`, affix vecs Implicit `+0xA0`/
   Explicit `+0xB8`/Enchant `+0xD0` (ModArrayStruct stride `0x40`, `+0x28` → Mods.dat row → first qword →
   UTF-16 internal mod id); Stack count `+0x18`; RenderItem art `+0x28`.
-- **Still TBD:** camera world→screen matrix (for world-space nameplates); friendly area Name string.
+- Atlas node (✓ live, Research `--atlas-graph`/`--atlas-probe`): GridPos `+0x310` (StdTuple2D<int>,
+  the node-graph key, ✓ 783/783 self-consistent live), DataMapId `+0x290` (ptr chain → UTF-16
+  "MapXxx", the rolled map, ✓ 766/783 live), canvas ConnectionsVec `+0x590` (✓ 1249 edges, 100%
+  endpoints on real grid positions), CurrentMarkerNodePtr `+0x2E8`. The node-class vtable is
+  detected by scoring GRID POSITION uniqueness (each real node owns a distinct (x,y)), NOT
+  biome/icon-size — both of those have drifted to garbage and will silently pick the wrong UI class
+  if trusted. Biome `+0x32E` and node Content `+0x310` (now aliases GridPos) are unresolved/
+  repurposed — do not read them.
+  **DataStatus `+0x2BC` (u8 within nodeData via DataStorage `+0x10`→DataModel `+0x20`: bit0
+  accessible, bit1 completed, bit2 locked) is UNRESOLVED as of 2026-09-14** — it reads a constant
+  (every node "locked") on a live character with clear atlas progress, so accessible/completed-frontier
+  routing may come up empty. Needs fresh discovery (the nodeData sub-struct likely differs by node
+  KIND — map/boss/tower/citadel — so a flat byte-offset scan across all node instances is the wrong
+  method); `AtlasNode.Flags +0x32F` (bit0 unlocked/bit1 visited) is an untried simpler alternative.
+- **Still TBD:** camera world→screen matrix (for world-space nameplates).
 
 ## Releasing
 

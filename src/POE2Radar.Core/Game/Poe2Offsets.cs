@@ -66,7 +66,7 @@ public static class Poe2
     /// </summary>
     public static class AreaInstance
     {
-        public static readonly int AreaInfoPtr      = OffsetOverrides.Get("AreaInstance.AreaInfoPtr", 0x098);  // ✓ → AreaInfo; +0x00 → UTF-16 "Code\0Name\0" (Code validated 'G1_15'). 2026-09-04 patch shifted -0x08 (was 0x0A0).
+        public static readonly int AreaInfoPtr      = OffsetOverrides.Get("AreaInstance.AreaInfoPtr", 0x098);  // ✓ → WorldAreas row (see Poe2.AreaInfo); Code validated 'G1_15'. 2026-09-04 patch shifted -0x08 (was 0x0A0, which now holds the WorldAreas.dat file object, not the row).
         public static readonly int LocalPlayer      = OffsetOverrides.Get("AreaInstance.LocalPlayer", 0x5D0);  // ✓ → player Entity (value-scanned player matched here). 2026-09-04 patch shifted +0x10 (was 0x5C0); 2026-07-16 shifted +0x08 (was 0x5B8); 2026-06-25 shifted +0x18 (was 0x5A0).
         public static readonly int ServerDataPtr    = OffsetOverrides.Get("AreaInstance.ServerDataPtr", 0x5B0);  // ✓ → ServerData (gateway to player inventories; +0x20 here = LocalPlayer @ 0x5D0). 2026-09-04 patch shifted +0x10 (was 0x5A0); 2026-07-16 shifted +0x08 (was 0x598); 2026-06-25 shifted +0x18 (was 0x580).
         public static readonly int AwakeEntities    = OffsetOverrides.Get("AreaInstance.AwakeEntities", 0x6F0);  // ✓ StdMap of live entities (id→EntityPtr). 2026-09-04 patch shifted +0x10 (was 0x6E0); 2026-07-16 shifted +0x08 (was 0x6D8); 2026-06-25 shifted +0x18 (was 0x6C0).
@@ -74,6 +74,18 @@ public static class Poe2
         public static readonly int TerrainMetadata  = OffsetOverrides.Get("AreaInstance.TerrainMetadata", 0x8D0);  // ✓ TerrainStruct base. 2026-09-04 patch shifted +0x10 (was 0x8C0); 2026-07-16 shifted +0x08 (was 0x8B8); 2026-06-25 shifted +0x18 (was 0x8A0).
         public static readonly int CurrentAreaLevel = OffsetOverrides.Get("AreaInstance.CurrentAreaLevel", 0x0BC);  // ✓ int — per-area, validated 15 in G1_15. 2026-09-04 patch shifted -0x08 (was 0x0C4).
         public static readonly int CurrentAreaHash  = OffsetOverrides.Get("AreaInstance.CurrentAreaHash", 0x114);  // ✓ uint — per-area random hash (+0x118 paired seed). 2026-09-04 patch shifted -0x08 (was 0x11C).
+    }
+
+    /// <summary>
+    /// A WorldAreas.dat row, reached via <see cref="AreaInstance.AreaInfoPtr"/>. Both fields are raw
+    /// (unaligned) pointers to NUL-terminated UTF-16 — they are NOT std::wstring. ✓ live 2026-09-05.
+    /// <para>Before the 2026-09-05 league patch the reader assumed Name sat immediately after Code's
+    /// terminator; the row now pads between them, so read Name through its own pointer.</para>
+    /// </summary>
+    public static class AreaInfo
+    {
+        public static readonly int Code = OffsetOverrides.Get("AreaInfo.Code", 0x00); // ✓ → UTF-16 area code (e.g. "G1_15")
+        public static readonly int Name = OffsetOverrides.Get("AreaInfo.Name", 0x08); // ✓ → UTF-16 display name (e.g. "Clearfell Encampment")
     }
 
     /// <summary>Entity StdMap conventions. Maps live at AreaInstance+0x6C0 (Awake) / +0x6D0 (Sleeping).</summary>
@@ -101,8 +113,8 @@ public static class Poe2
     {
         public static readonly int EntityDetailsPtr = OffsetOverrides.Get("Entity.EntityDetailsPtr", 0x08); // ✓ → EntityDetails
         public static readonly int ComponentList    = OffsetOverrides.Get("Entity.ComponentList", 0x10); // ✓ StdVector of component pointers (8-byte elems)
-        public static readonly int Id               = OffsetOverrides.Get("Entity.Id", 0x80); // (GH2) uint  (read 0 for local player — revisit)
-        public static readonly int IsValid          = OffsetOverrides.Get("Entity.IsValid", 0x84); // (GH2) byte; valid when bit0 clear
+        public static readonly int Id               = OffsetOverrides.Get("Entity.Id", 0x88); // ✓ uint. 2026-09-05 league patch: was 0x80 (which read 0 for the local player — that was the drift, not a quirk).
+        public static readonly int IsValid          = OffsetOverrides.Get("Entity.IsValid", 0x8C); // ✓ byte; valid when bit0 clear. 2026-09-05 league patch: was 0x84.
     }
 
     public static class EntityDetails
@@ -479,14 +491,14 @@ public static class Poe2
         public static readonly int Self           = OffsetOverrides.Get("UiElement.Self", 0x08);  // ✓ self pointer
         public static readonly int Children       = OffsetOverrides.Get("UiElement.Children", 0x10);  // ✓ StdVector begin (child UiElement ptrs); End @ +0x18
         public static readonly int ChildrenEnd    = OffsetOverrides.Get("UiElement.ChildrenEnd", 0x18);  // ✓ StdVector end
-        public static readonly int PositionModifier = OffsetOverrides.Get("UiElement.PositionModifier", 0xF0); // StdTuple2D<float>; added to parent pos when Flags bit 0x0A set (GH2 UiElementBase)
-        public static readonly int Parent         = OffsetOverrides.Get("UiElement.Parent", 0xB8);  // (community) parent UiElement; true UI root = *(UiRoot+0xB8)
-        public static readonly int RelativePos    = OffsetOverrides.Get("UiElement.RelativePos", 0x118); // ✓ StdTuple2D<float> position relative to parent (varies per atlas node)
-        public static readonly int LocalScaleMul  = OffsetOverrides.Get("UiElement.LocalScaleMul", 0x130); // float local scale multiplier (also the atlas zoom on node elements)
+        public static readonly int PositionModifier = OffsetOverrides.Get("UiElement.PositionModifier", 0x108); // StdTuple2D<float>; added to parent pos when Flags bit 0x0A set. 2026-09-05 league patch: was 0xF0 (moved +0x18, NOT the -0x18 the neighbouring fields took — do not infer it).
+        public static readonly int Parent         = OffsetOverrides.Get("UiElement.Parent", 0xB8);  // ✓ (community) parent UiElement; true UI root = *(UiRoot+0xB8). UNCHANGED by the 2026-09-05 league patch — the class did NOT shift uniformly: Self/Children/Parent held still while Flags moved -0x18 and Text -0x30, so verify each field, never apply one blanket shift.
+        public static readonly int RelativePos    = OffsetOverrides.Get("UiElement.RelativePos", 0x100); // ✓ StdTuple2D<float> position relative to parent (varies per atlas node). 2026-09-05 league patch: -0x18 (was 0x118).
+        public static readonly int LocalScaleMul  = OffsetOverrides.Get("UiElement.LocalScaleMul", 0x118); // float local scale multiplier (also the atlas zoom on node elements). 2026-09-05 league patch: -0x18 (was 0x130).
         public static readonly int Flags          = OffsetOverrides.Get("UiElement.Flags", 0x168); // ✓ uint; IsVisibleLocal = bit 0x0B (toggle-diff: 0x2EF1↔0x26F1). 2026-09-04 patch shifted -0x18 (was 0x180); re-found live via --areascan (root 0x502EF0 / child 0x502EF1).
         public static readonly int FlagVisibleBit = OffsetOverrides.Get("UiElement.FlagVisibleBit", 0x0B);  // ✓ visible bit (set when shown)
-        public static readonly int FlagModifyPosBit = OffsetOverrides.Get("UiElement.FlagModifyPosBit", 0x0A); // when set, PositionModifier (+0xF0) is added to the parent pos
-        public static readonly int ScaleIndex     = OffsetOverrides.Get("UiElement.ScaleIndex", 0x18A); // byte; selects which axis scale(s) apply (1=v1,2=v2,3=v1×v2). root=3
+        public static readonly int FlagModifyPosBit = OffsetOverrides.Get("UiElement.FlagModifyPosBit", 0x0A); // when set, PositionModifier (+0x108) is added to the parent pos
+        public static readonly int ScaleIndex     = OffsetOverrides.Get("UiElement.ScaleIndex", 0x172); // byte; selects which axis scale(s) apply (1=v1,2=v2,3=v1×v2). root=3. 2026-09-05 league patch: -0x18 (was 0x18A).
         public static readonly int Text           = OffsetOverrides.Get("UiElement.Text", 0x360); // std::wstring of the element's displayed text (font name @ +0xC8).
                                                   // Validated live 2026-06-14: every text element (loot tags, skill
                                                   // rows, runeforge rows) holds its UTF-16 string here.
@@ -495,8 +507,8 @@ public static class Poe2
                                                   // content: +0x360 reads UI copy ("Entering Ogham Manor", "kills"),
                                                   // while +0x378 holds internal element NAMES ("modal_dialog_overlay",
                                                   // "HUD") and would silently pass a "is it a string?" check.
-        public static readonly int SizeW          = OffsetOverrides.Get("UiElement.SizeW", 0x288); // ✓ float unscaled width  (atlas node = 40)
-        public static readonly int SizeH          = OffsetOverrides.Get("UiElement.SizeH", 0x28C); // ✓ float unscaled height (atlas node = 40)
+        public static readonly int SizeW          = OffsetOverrides.Get("UiElement.SizeW", 0x270); // ✓ float unscaled width  (atlas node = 40). 2026-09-05 league patch: -0x18 (was 0x288).
+        public static readonly int SizeH          = OffsetOverrides.Get("UiElement.SizeH", 0x274); // ✓ float unscaled height (atlas node = 40). 2026-09-05 league patch: -0x18 (was 0x28C).
         // Full visibility is hierarchical: an element is shown iff its own bit 0x0B AND every
         // ancestor's bit are set. Walk Parent (+0xB8) up to the root.
         // Screen geometry (GH2 UiElementBaseFuncs): v1 = winW/2560, v2 = winH/1600 (BaseResolution
@@ -519,8 +531,8 @@ public static class Poe2
             { 0x00462EF1, 0x00502EF3, 0x00502EF7, 0x00542EF1, 0x00502EF1 };
         public static readonly int GateStep = OffsetOverrides.Get("Runeforge.GateStep", 0);       // the window-container; its visible bit gates panel-open
         public static readonly int ViewportStep = OffsetOverrides.Get("Runeforge.ViewportStep", 2);   // this hop's element holds the scroll offset (+0x120)
-        public static readonly int ScrollOffset = OffsetOverrides.Get("Runeforge.ScrollOffset", 0x120); // StdTuple2D<float> viewport scroll offset
-        public static readonly int NameWString = OffsetOverrides.Get("Runeforge.NameWString", 0x390);  // visible row's kid[0]: inline std::wstring "<count>x <name>"
+        public static readonly int ScrollOffset = OffsetOverrides.Get("Runeforge.ScrollOffset", 0x108); // StdTuple2D<float> viewport scroll offset. 2026-09-05 league patch: -0x18 (was 0x120).
+        public static readonly int NameWString = UiElement.Text;  // visible row's kid[0]: inline std::wstring "<count>x <name>" — always the generic Text field; keep it derived so it can't drift apart from it.
     }
 
     /// <summary>The world Entity currently under the cursor — monsters, NPCs, doodads, ground items
@@ -609,17 +621,17 @@ public static class Poe2
     /// reading +0x08 fixed web-UI filters where Prettify(code) mismatched the in-game name.</summary>
     public static class AtlasMapRow
     {
-        public static readonly int WorldAreaName = OffsetOverrides.Get("AtlasMapRow.WorldAreaName", 0x08); // ✓ WorldAreas row +0x08 → UTF-16 localized map name
+        public static readonly int WorldAreaName = OffsetOverrides.Get("AtlasMapRow.WorldAreaName", 0x32); // ✓ live 2026-09-05 — packed ptr → localized name ("[DNT] District B"). 2026-09-05 league patch: was 0x08, which now holds an art path (*.dds), not the name.
     }
 
     public static class AtlasNode
     {
         public static readonly int MapNodeId   = OffsetOverrides.Get("AtlasNode.MapNodeId", 0x300); // ✓ u32 — distinct per node
-        public static readonly int Content     = OffsetOverrides.Get("AtlasNode.Content", 0x310); // (community) u32 content (0 = none)
+        public static readonly int Content     = OffsetOverrides.Get("AtlasNode.Content", 0x310); // ⚠ 2026-09-05 league patch: this slot is now GridPos, NOT a content-row ptr. Do not read as content.
         public static readonly int State       = OffsetOverrides.Get("AtlasNode.State", 0x32C); // (community) u8 state (seen =1 on loaded nodes)
-        public static readonly int Biome       = OffsetOverrides.Get("AtlasNode.Biome", 0x32E); // ✓ u8 biome index (0..12)
+        public static readonly int Biome       = OffsetOverrides.Get("AtlasNode.Biome", 0x32E); // ⚠ 2026-09-05 league patch: NO LONGER a 0..12 biome index (byte scatter 0..255); no biome-shaped field found on the node or its data struct. Unresolved — do not rely on it.
         public static readonly int Flags       = OffsetOverrides.Get("AtlasNode.Flags", 0x32F); // (community) u8: bit0 unlocked, bit1 visited
-        public static readonly int GridPos     = OffsetOverrides.Get("AtlasNode.GridPos", 0x320); // ✓ live 2026-06-08 — StdTuple2D<int> atlas grid coord (X,Y); 1:1 with node, range small (e.g. X[-16..31] Y[0..47]). The key for node-graph pathfinding. (GameHelper2-sourced)
+        public static readonly int GridPos     = OffsetOverrides.Get("AtlasNode.GridPos", 0x310); // ✓ live 2026-09-05 — StdTuple2D<int> X[-48..31] Y[16..127], the node-graph key; 1:1 with node. 2026-09-05 league patch: was 0x320.
         public static readonly int Completion  = OffsetOverrides.Get("AtlasNode.Completion", 0x339); // (community) u8 per-node completion id
         public static readonly int ContentVec  = OffsetOverrides.Get("AtlasNode.ContentVec", 0x350); // (community) StdVector begin (content list); End @ +0x358
 
@@ -632,8 +644,19 @@ public static class Poe2
         public static readonly int DataStorage = OffsetOverrides.Get("AtlasNode.DataStorage", 0x10);   // *(node+0x10) → storage
         public static readonly int DataModel   = OffsetOverrides.Get("AtlasNode.DataModel", 0x20);   // *(storage+0x20) → nodeData
         public static readonly int DataBiome   = OffsetOverrides.Get("AtlasNode.DataBiome", 0x2CE);  // u8 within nodeData
-        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2CF);  // u8 within nodeData: bit0 accessible, bit1 completed
-        public static readonly int DataMapId   = OffsetOverrides.Get("AtlasNode.DataMapId", 0x2A0);  // ptr chain → UTF-16 "MapXxx"
+        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2BC);  // ⚠ 2026-09-05 was 0x2CF, which read a CONSTANT (every node Completed=true, hiding the atlas).
+                                               // 0x2BC fixed that as of the 2026-09-05 league patch, but re-verified live
+                                               // 2026-09-14: it now ALSO reads a constant (every sampled node = 4/"locked")
+                                               // on a lvl-91 character with clear atlas progress — a further drift, NOT
+                                               // yet re-discovered. Byte-scanning nearby offsets (Research --atlas-graph's
+                                               // fallback scan) found no clean small-enum replacement in +0x200..+0x310;
+                                               // the nodeData sub-struct likely differs by node KIND (map/boss/tower/
+                                               // citadel), so a flat offset scan across all of them is the wrong method —
+                                               // needs a scan restricted to one kind, or a fresh DevTree walk. Until then,
+                                               // treat Accessible/Completed as UNRELIABLE (accessible-frontier routing may
+                                               // come up empty). AtlasNode.Flags (+0x32F, bit0 unlocked/bit1 visited) is an
+                                               // untried, structurally simpler alternative worth checking first.
+        public static readonly int DataMapId   = OffsetOverrides.Get("AtlasNode.DataMapId", 0x290);  // ✓ live 2026-09-05 — ptr chain → UTF-16 "MapXxx" (the ROLLED map). 2026-09-05 league patch: was 0x2A0.
     }
 
     /// <summary>Atlas CONNECTION GRAPH (✓ live 2026-06-08, GameHelper2-sourced). The node canvas (the
@@ -646,7 +669,7 @@ public static class Poe2
     /// Re-discover after a patch with <c>POE2Radar.Research --atlas-graph</c>.</summary>
     public static class AtlasGraph
     {
-        public static readonly int ConnectionsVec = OffsetOverrides.Get("AtlasGraph.ConnectionsVec", 0x5A8); // on the node canvas: StdVector<edge> begin; End @ +0x5B0
+        public static readonly int ConnectionsVec = OffsetOverrides.Get("AtlasGraph.ConnectionsVec", 0x590); // ✓ live 2026-09-05 canvas StdVector<edge>; End @ +0x598. 2026-09-05 league patch: -0x18 (was 0x5A8).
         public static readonly int EdgeStride     = OffsetOverrides.Get("AtlasGraph.EdgeStride", 20);
         public static readonly int EdgeSourceOff  = OffsetOverrides.Get("AtlasGraph.EdgeSourceOff", 0x04);  // StdTuple2D<int>
         public static readonly int EdgeTargetOff  = OffsetOverrides.Get("AtlasGraph.EdgeTargetOff", 0x0C);  // StdTuple2D<int>
@@ -657,7 +680,7 @@ public static class Poe2
         /// accessor is structural, not vtable-keyed (the marker's class drifts per patch), so it's found by
         /// "the lone non-node element whose +0x300 ∈ node set". <c>currentNode = *(marker + 0x300)</c>, then
         /// read the node's <see cref="AtlasNode.GridPos"/>. Re-discover with <c>--atlas-marker</c>.</summary>
-        public static readonly int CurrentMarkerNodePtr = OffsetOverrides.Get("AtlasGraph.CurrentMarkerNodePtr", 0x300);
+        public static readonly int CurrentMarkerNodePtr = OffsetOverrides.Get("AtlasGraph.CurrentMarkerNodePtr", 0x2E8); // ✓ live 2026-09-05. 2026-09-05 league patch: was 0x300.
     }
 
     /// <summary>Atlas screen panel — a PERSISTENT direct child of UiRoot (the element at
