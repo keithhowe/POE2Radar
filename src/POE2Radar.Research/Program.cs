@@ -396,6 +396,9 @@ if (HasFlag(args, "--atlas-resolve"))
 if (HasFlag(args, "--atlas-graph"))
     return RunAtlasGraph(process, reader);
 
+if (HasFlag(args, "--atlas-statusscan"))
+    return RunAtlasStatusScan(process, reader, TryGetStrArg(args, "--grid"));
+
 if (HasFlag(args, "--atlas-status"))
     return RunAtlasStatus(process, reader);
 
@@ -8056,6 +8059,161 @@ static int RunAtlasStatus(ProcessHandle process, MemoryReader reader)
 //    dump everything relevant to why routing might not reach it: GridPos, DataStatus decode, elem
 //    Unlocked/Visited, and its GRAPH DEGREE (edges touching its grid coord) — a node with degree 0 is
 //    graph-isolated and no A* route can ever reach it regardless of accessible/completed status. ──
+// ── Atlas STATUS byte discovery, take 2 (2026-09-14): the previous correlation used elem Flags (+0x32F)
+//    as ground truth, but that byte now reads 0x00/0xFF in lockstep with the +0x2CF byte (0/255) — two
+//    drifted fields validating each other. This probe uses the UiElement VISIBLE bit instead (a field we
+//    trust: the game leaves it OFF for fog-of-war tiles), splits every candidate byte in nodeData into
+//    revealed-vs-fogged histograms, and reports offsets that are uniform on fogged nodes but varied on
+//    revealed ones (a status enum's signature). `--grid "x,y;x,y"` additionally dumps raw nodeData bytes
+//    for specific nodes so the user can supply ground truth (F10 prints each tile's grid coord). ──
+static int RunAtlasStatusScan(ProcessHandle process, MemoryReader reader, string? gridList)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
+    Console.WriteLine("ATLAS STATUS SCAN — nodeData bytes split by the element VISIBLE bit (revealed vs fogged)\n=========================================================================================");
+    var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: atlas-node class not found ({nodes.Count} instances). Open the Atlas MAP view, then re-run."); return 1; }
+    Console.WriteLine($"[0] node class 0x{vt:X}  canvas 0x{canvas:X}  ({nodes.Count} node instances)\n");
+
+    uint visMask = 1u << Poe2.UiElement.FlagVisibleBit;
+    bool HierVisible(nint el)
+    {
+        var cur = el; var guard = 0;
+        while (cur != 0 && guard++ < 16)
+        {
+            if (!reader.TryReadStruct<uint>(cur + Poe2.UiElement.Flags, out var fl)) return false;
+            if ((fl & visMask) == 0) return false;
+            var par = SafePtr(reader, cur + Poe2.UiElement.Parent);
+            if (par == cur) break; cur = par;
+        }
+        return true;
+    }
+    string MapName(nint data)
+    {
+        var cur = data + Poe2.AtlasNode.DataMapId;
+        for (var hop = 0; hop < 4 && cur != 0; hop++)
+        {
+            var s = reader.ReadStringUtf16(cur, 64);
+            if (s.StartsWith("Map", StringComparison.Ordinal)) return s;
+            cur = SafePtr(reader, cur);
+        }
+        return "?";
+    }
+
+    var samples = new List<(nint el, nint data, (int, int) grid, bool localVis, bool hierVis)>();
+    foreach (var el in nodes)
+    {
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var uf);
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+        var data = storage != 0 ? SafePtr(reader, storage + Poe2.AtlasNode.DataModel) : 0;
+        if (data == 0) continue;
+        samples.Add((el, data, (gx, gy), (uf & visMask) != 0, HierVisible(el)));
+    }
+    var nVis = samples.Count(s => s.localVis); var nFog = samples.Count - nVis;
+    Console.WriteLine($"[1] ground truth = elem VISIBLE bit: {nVis} revealed, {nFog} fogged  (hierarchically visible: {samples.Count(s => s.hierVis)})  of {samples.Count} with nodeData\n");
+
+    // Raw dumps for user-specified nodes first (ground-truth anchors).
+    if (!string.IsNullOrWhiteSpace(gridList))
+    {
+        Console.WriteLine("[2] raw nodeData bytes for the requested grid coords (+0x280..+0x30F), plus elem fields:");
+        foreach (var part in gridList.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var xy = part.Split(',');
+            if (xy.Length != 2 || !int.TryParse(xy[0], out var qx) || !int.TryParse(xy[1], out var qy)) { Console.WriteLine($"    bad grid '{part}'"); continue; }
+            var hit = samples.FirstOrDefault(s => s.grid == (qx, qy));
+            if (hit.el == 0) { Console.WriteLine($"    ({qx},{qy}): not found"); continue; }
+            reader.TryReadStruct<byte>(hit.el + Poe2.AtlasNode.Flags, out var ef);
+            reader.TryReadStruct<byte>(hit.el + Poe2.AtlasNode.State, out var es);
+            reader.TryReadStruct<byte>(hit.el + Poe2.AtlasNode.Completion, out var ec);
+            Console.WriteLine($"    ({qx},{qy}) {MapName(hit.data)}  el=0x{hit.el:X} data=0x{hit.data:X}  visible={hit.localVis} hier={hit.hierVis}  elemFlags=0x{ef:X2} state={es} completion={ec}");
+            for (var o = 0x280; o < 0x310; o += 0x10)
+            {
+                var sb = new System.Text.StringBuilder($"        +0x{o:X3}: ");
+                for (var k = 0; k < 16; k++) { reader.TryReadStruct<byte>(hit.data + o + k, out var b); sb.Append(b.ToString("X2")).Append(' '); }
+                Console.WriteLine(sb.ToString());
+            }
+        }
+        Console.WriteLine();
+    }
+
+    Console.WriteLine("[3] candidate byte offsets in nodeData (+0x200..+0x30F): uniform on FOGGED nodes, varied on REVEALED nodes, ≤6 distinct values overall");
+    Console.WriteLine($"    (committed DataStatus=+0x{Poe2.AtlasNode.DataStatus:X3}; upstream v0.18.0 used +0x2BC)");
+    var any = false;
+    for (var o = 0x200; o < 0x310; o++)
+    {
+        var hv = new Dictionary<byte, int>(); var hf = new Dictionary<byte, int>();
+        foreach (var s in samples)
+        {
+            if (!reader.TryReadStruct<byte>(s.data + o, out var b)) continue;
+            var h = s.localVis ? hv : hf; h[b] = h.GetValueOrDefault(b) + 1;
+        }
+        var distinct = new HashSet<byte>(hv.Keys); distinct.UnionWith(hf.Keys);
+        var interesting = o == Poe2.AtlasNode.DataStatus || o == 0x2BC
+            || (distinct.Count is >= 2 and <= 6 && hv.Count >= 2 && hf.Count <= 2);
+        if (!interesting) continue;
+        any = true;
+        string H(Dictionary<byte, int> h) => string.Join(" ", h.OrderBy(k => k.Key).Select(k => $"{k.Key}=x{k.Value}"));
+        Console.WriteLine($"    +0x{o:X3}{(o == Poe2.AtlasNode.DataStatus ? " (committed)" : o == 0x2BC ? " (upstream)" : "")}  revealed→{{{H(hv)}}}  fogged→{{{H(hf)}}}");
+    }
+    if (!any) Console.WriteLine("    (none)");
+
+    // [4] Cross-tab of the neighbouring bytes seen in the raw dumps: +0x2CB (has-state flag?), +0x2CF, +0x2D0, +0x2D1.
+    Console.WriteLine("\n[4] tuple histogram (+0x2CB, +0x2CF, +0x2D0, +0x2D1) → revealed / fogged counts:");
+    var tup = new Dictionary<(byte, byte, byte, byte), (int vis, int fog)>();
+    var ones = new List<(nint data, (int, int) grid, bool vis)>();
+    var zeros = new List<(nint data, (int, int) grid, bool vis)>();
+    foreach (var s in samples)
+    {
+        reader.TryReadStruct<byte>(s.data + 0x2CB, out var a); reader.TryReadStruct<byte>(s.data + 0x2CF, out var b);
+        reader.TryReadStruct<byte>(s.data + 0x2D0, out var c); reader.TryReadStruct<byte>(s.data + 0x2D1, out var d);
+        var k = (a, b, c, d); var cur = tup.GetValueOrDefault(k);
+        tup[k] = s.localVis ? (cur.vis + 1, cur.fog) : (cur.vis, cur.fog + 1);
+        if (b == 1) ones.Add((s.data, s.grid, s.localVis));
+        else if (b == 0) zeros.Add((s.data, s.grid, s.localVis));
+    }
+    foreach (var kv in tup.OrderByDescending(k => k.Value.vis + k.Value.fog).Take(16))
+        Console.WriteLine($"    2CB={kv.Key.Item1,3} 2CF={kv.Key.Item2,3} 2D0={kv.Key.Item3,3} 2D1={kv.Key.Item4,3}   revealed x{kv.Value.vis,-5} fogged x{kv.Value.fog}");
+
+    Console.WriteLine($"\n[5] nodes with +0x2CF == 1 ({ones.Count}) — hypothesis: the RUNNABLE frontier. Check these against the atlas:");
+    foreach (var n in ones.OrderBy(n => n.grid)) Console.WriteLine($"    {n.grid,-10} {MapName(n.data),-32} visible={n.vis}");
+    Console.WriteLine($"\n[6] nodes with +0x2CF == 0 ({zeros.Count}) — hypothesis: COMPLETED. First 25 by grid:");
+    foreach (var n in zeros.OrderBy(n => n.grid).Take(25)) Console.WriteLine($"    {n.grid,-10} {MapName(n.data),-32} visible={n.vis}");
+
+    // [7] Is "accessible" STORED in the byte, or DERIVED from adjacency? Game rule: a map is runnable when it
+    //     is not completed and touches a completed one. Read the canvas edge vector, take every non-completed
+    //     neighbour of a completed node, and histogram THEIR status byte. If most read 255, the byte does not
+    //     encode runnability (and value 1 is something else — e.g. attempted/failed).
+    {
+        var adj = new Dictionary<(int, int), HashSet<(int, int)>>();
+        var eb = SafePtr(reader, canvas + Poe2.AtlasGraph.ConnectionsVec);
+        if (eb != 0 && reader.TryReadStruct<nint>(canvas + Poe2.AtlasGraph.ConnectionsVec + 8, out var ee) && ee > eb)
+        {
+            var cnt = ((long)ee - (long)eb) / Poe2.AtlasGraph.EdgeStride;
+            for (long i = 0; i < cnt && i < 200_000; i++)
+            {
+                var e = eb + (nint)(i * Poe2.AtlasGraph.EdgeStride);
+                if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff, out var sx) || !reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff + 4, out var sy)) continue;
+                if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff, out var dx) || !reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff + 4, out var dy)) continue;
+                if (!adj.TryGetValue((sx, sy), out var l1)) adj[(sx, sy)] = l1 = new(); l1.Add((dx, dy));
+                if (!adj.TryGetValue((dx, dy), out var l2)) adj[(dx, dy)] = l2 = new(); l2.Add((sx, sy));
+            }
+        }
+        var statusByGrid = new Dictionary<(int, int), byte>();
+        foreach (var s in samples) if (reader.TryReadStruct<byte>(s.data + Poe2.AtlasNode.DataStatus, out var b)) statusByGrid[s.grid] = b;
+        var completedGrids = statusByGrid.Where(k => k.Value == 0).Select(k => k.Key).ToHashSet();
+        var frontier = new HashSet<(int, int)>();
+        foreach (var c in completedGrids) if (adj.TryGetValue(c, out var ns)) foreach (var n in ns) if (statusByGrid.TryGetValue(n, out var nb) && nb != 0) frontier.Add(n);
+        var fh = new Dictionary<byte, int>(); foreach (var g in frontier) { var b = statusByGrid[g]; fh[b] = fh.GetValueOrDefault(b) + 1; }
+        var oneGrids = statusByGrid.Where(k => k.Value == 1).Select(k => k.Key).ToList();
+        var onesAdj = oneGrids.Count(g => adj.TryGetValue(g, out var ns) && ns.Any(completedGrids.Contains));
+        Console.WriteLine($"\n[7] adjacency test: {adj.Count} graph nodes, {completedGrids.Count} completed (status 0), {frontier.Count} non-completed neighbours of completed nodes");
+        Console.WriteLine($"    status of those neighbours: {{{string.Join(", ", fh.OrderBy(k => k.Key).Select(k => $"{k.Key}=x{k.Value}"))}}}   ← if mostly 255, runnability is NOT stored in the byte");
+        Console.WriteLine($"    status==1 nodes: {oneGrids.Count}, of which adjacent to a completed node: {onesAdj}");
+    }
+    return 0;
+}
 static int RunAtlasNodeFind(ProcessHandle process, MemoryReader reader, string needle)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
@@ -9766,3 +9924,4 @@ static class Win
 }
 
 readonly record struct VecLayout(int VecOff, int ElemSize, int SlotA, int SlotB);
+

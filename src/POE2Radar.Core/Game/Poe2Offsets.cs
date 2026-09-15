@@ -644,28 +644,21 @@ public static class Poe2
         public static readonly int DataStorage = OffsetOverrides.Get("AtlasNode.DataStorage", 0x10);   // *(node+0x10) → storage
         public static readonly int DataModel   = OffsetOverrides.Get("AtlasNode.DataModel", 0x20);   // *(storage+0x20) → nodeData
         public static readonly int DataBiome   = OffsetOverrides.Get("AtlasNode.DataBiome", 0x2CE);  // u8 within nodeData
-        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2CF);  // ✓ live 2026-09-14 — u8: 0=locked, 1=accessible (not yet run), 255=completed.
-                                               // (bit0 accessible / bit1 completed still decodes all three values correctly:
-                                               // 0&1=0/0&2=0, 1&1=1/1&2=0, 255&1=1/255&2=1 — a completed map is also
-                                               // "accessible" since PoE2 lets you re-run it.) The 2026-09-05 league patch
-                                               // had moved this to 0x2BC, but as of 2026-09-14 it's back at 0x2CF (perhaps
-                                               // reverted by a follow-up patch) — re-verify per patch, don't assume either
-                                               // value is stable. Discovered by correlating candidate bytes against the
-                                               // separately-trusted AtlasNode.Flags Unlocked/Visited bits (Research
-                                               // --atlas-status) rather than guessing a value range: disjoint, fully
-                                               // explained 3-way split, 1095/1095 nodes, zero ambiguous reads.
-                                               // ⚠ That validation holds for ordinary biome maps only. Proven WRONG live
-                                               // 2026-09-15 for "arbiter"-tagged boss-encounter nodes (Matriarch/Patriarch
-                                               // Halls, etc.): an untouched farmable instance read Completed=true while the
-                                               // one-time quest variant the player HAD already beaten read Completed=false
-                                               // — wrong in BOTH directions, on the SAME field, at the SAME time. The
-                                               // elem-level Flags Unlocked/Visited bits were equally wrong for these nodes.
-                                               // This isn't a value-range miss; the nodeData sub-struct is almost certainly
-                                               // shaped differently for this node KIND and this offset lands on padding/an
-                                               // unrelated field, not status. Overlay code (RadarApp.UpdateAtlas) treats
-                                               // Accessible/Completed as untrustworthy for any node tagged "arbiter" in
-                                               // atlas_maps.json rather than gating visibility/routing on it. No known
-                                               // offset currently recovers true per-node completion for this content kind.
+        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2CF);  // ✓ live 2026-09-14/15 (Research --atlas-statusscan, 2008 nodes) — u8 ENUM, not a bitfield:
+                                               //   0 = COMPLETED (256 nodes on a lvl-91 char), 1 = seen on 19 nodes but NOT runnable (see StatusOne;
+                                               //   RUNNABLE is not stored — Poe2Atlas derives it from graph adjacency to a completed map), 255 = no state.
+                                               // Decoding it as bits (bit0 accessible, bit1 completed) read 255 as "accessible AND completed",
+                                               // which is what "every node Completed=true hid the atlas" (2026-09-05) and the one-hop
+                                               // auto-routes (2026-09-14) both were; it also manufactured the "arbiter nodes read backwards"
+                                               // contradiction (an untouched instance = 255 = locked, a beaten quest variant = 0 = completed —
+                                               // both correct under the enum). Sits inside a small state block: DataHasState +0x2CB (1 = the
+                                               // node carries state at all), DataBiome +0x2CE, this byte +0x2CF, +0x2D0 a small per-completed
+                                               // kind/tier code (1,3,7..12 — unresolved), +0x2D1..+0x2D5 0xFF on stateless nodes. The 2026-09-05
+                                               // league patch had this at 0x2BC (now a constant 4) — re-verify per patch.
+        public static readonly int DataHasState = OffsetOverrides.Get("AtlasNode.DataHasState", 0x2CB); // u8: 1 = node has state (revealed/activated), 0 = none (fogged). Diagnostic; DataStatus==255 already covers "no state".
+        public const byte StatusCompleted  = 0;    // DataStatus enum values (see above)
+        public const byte StatusOne       = 1;    // NOT runnable (adjacency test 2026-09-15: every non-completed neighbour of a completed map reads 255). Seen on 19 nodes in one region; likely attempted/failed — unresolved.
+        public const byte StatusLocked     = 255;
         public static readonly int DataMapId   = OffsetOverrides.Get("AtlasNode.DataMapId", 0x290);  // ✓ live 2026-09-05 — ptr chain → UTF-16 "MapXxx" (the ROLLED map). 2026-09-05 league patch: was 0x2A0.
     }
 

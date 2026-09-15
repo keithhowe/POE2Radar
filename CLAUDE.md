@@ -166,21 +166,21 @@ is rescaled by liveZoom/calibZoom each frame. See `resources/atlas-research-note
   `Y down to -32`, in a different, further-explored region. Both bugs are exactly why atlas
   detection could work in one spot and silently fail in another — "sometimes works" wasn't node
   data flakiness, it was the detector's own box being too small for wherever the player currently is.
-  DataStatus `+0x2CF` (u8 within nodeData via DataStorage `+0x10`→DataModel `+0x20`: 0=locked,
-  1=accessible, 255=completed — bit0 accessible/bit1 completed still decodes all three correctly).
-  This field is volatile across patches independent of everything else in this list — it was
-  `+0x2CF` pre-2026-09-05, moved to `+0x2BC` that patch, then was back at `+0x2CF` by 2026-09-14 —
-  re-verify it separately every time. **Proven WRONG for "arbiter"-tagged boss-encounter nodes**
-  (Matriarch/Patriarch Halls, etc.) live 2026-09-15: an untouched farmable instance read
-  Completed=true while the one-time quest variant the player HAD already beaten read
-  Completed=false — wrong in both directions on the same field at the same time, and the elem-level
-  `Flags` Unlocked/Visited bits were equally wrong for these nodes. The nodeData sub-struct is almost
-  certainly shaped differently for this node KIND; this offset likely lands on padding for it, not
-  status. `RadarApp.UpdateAtlas` treats Accessible/Completed as untrustworthy for any node tagged
-  "arbiter" (checked via the offline `atlas_maps.json` tags, not this live field) rather than gating
-  visibility/routing on it — no known offset currently recovers true per-node completion for this
-  content kind. For ordinary biome maps the field is fine: this is the routing "accessible frontier"
-  source (RadarApp: `sources`) for auto-routing to a target map.
+  DataStatus `+0x2CF` (u8 within nodeData via DataStorage `+0x10`→DataModel `+0x20`) is an **ENUM,
+  not a bitfield**: `0` = completed, `255` = no state, `1` = NOT runnable (19 nodes in one region; likely
+  attempted/failed, unresolved). **Runnable is not stored: `Poe2Atlas.ReadCanvasNodes` derives it as "not completed and graph-adjacent to a completed map"** (the game rule; adjacency test = `--atlas-statusscan` [7], every non-completed neighbour of a completed map read 255). That derived set is the auto-route SOURCE frontier (`RadarApp: sources`). Validated live 2026-09-14/15 with Research
+  `--atlas-statusscan` (splits every nodeData byte revealed-vs-fogged using the UiElement visible bit
+  as ground truth; `--grid "x,y;x,y"` dumps raw bytes for named tiles): 2008 nodes → 256 completed,
+  19 accessible, 1733 locked. Decoding it as bits read 255 as "accessible AND completed" — that
+  single mistake was "every node Completed=true hides the atlas" (2026-09-05), the one-hop
+  auto-routes from every neighbour (2026-09-14), AND the apparent "arbiter boss nodes read status
+  backwards" contradiction (untouched instance = 255 = locked; beaten quest variant = 0 = completed —
+  both right). Sibling bytes: `+0x2CB` = has-state (1 revealed/activated, 0 fogged), `+0x2CE` biome,
+  `+0x2D0` a small per-completed code (unresolved). This field moves independently of everything
+  else (was `+0x2BC` on 2026-09-05, now a constant 4 there) — re-verify it separately every patch.
+  Do NOT use elem `Flags +0x32F` / `MapNodeId +0x300` / `Completion +0x339` as ground truth for
+  anything: they read 0x00/0xFF, 0 and 0 on every node now (drifted), and correlating a candidate
+  against them "validated" the wrong decode once already.
 - **Still TBD:** camera world→screen matrix (for world-space nameplates).
 
 ## Releasing

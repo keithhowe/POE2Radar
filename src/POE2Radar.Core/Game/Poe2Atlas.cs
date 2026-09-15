@@ -278,7 +278,8 @@ public sealed class Poe2Atlas
         float X, float Y, float W, float H, float Scale, bool Visible, int IconType,
         int GridX, int GridY, string MapName, string MapCode, IReadOnlyList<string> Tags,
         bool Accessible, bool Completed, string Kind,
-        string MapType, string MapGroup, IReadOnlyList<string> MapDataTags)
+        string MapType, string MapGroup, IReadOnlyList<string> MapDataTags,
+        byte StatusRaw = 255)
     {
         /// <summary>The node's atlas grid coordinate (<see cref="Poe2Offsets.AtlasNode.GridPos"/>) — the
         /// key into the connection graph for routing (unique per node; stable while the atlas is open).</summary>
@@ -286,9 +287,10 @@ public sealed class Poe2Atlas
         public bool Unlocked => (Flags & 0x01) != 0;
         public bool Visited => (Flags & 0x02) != 0;
         public bool HasContent => Content != 0;   // +0x310 (atlas-row ptr) non-null ⇒ has rolled content
-        // Accessible/Completed are decoded from the deeper node-data status byte (the GameHelper-validated
-        // source — *(node+0x10)+0x20 +0x2CF, bit0 accessible / bit1 completed). Accessible ("you can run
-        // this now") is the route SOURCE frontier; the element-flag Unlocked/Visited bits are kept separate.
+        // Completed comes from the node-data status byte (*(node+0x10)+0x20 +0x2CF == 0; StatusRaw keeps the
+        // raw value: 0 completed, 255 no state, 1 unresolved — NOT runnable). Accessible ("you can run this
+        // now", the route SOURCE frontier) is DERIVED in ReadCanvasNodes from graph adjacency to a completed
+        // map; the element-flag Unlocked/Visited bits are drifted garbage on the current build.
     }
 
     private readonly object _nodeLock = new(); // ReadNodes is called from both the tick + API threads
@@ -416,16 +418,21 @@ public sealed class Poe2Atlas
             // (The fork's table marks this unresolved too; --atlas-gridscan finds no content vector on
             // either the +0x300 row or the nodeData struct.)
             var iconType = 0;
-            // Accessible/completed status: the GameHelper-validated deeper model
-            // *(node+DataStorage)+DataModel → status byte +0x2CF (bit0 accessible, bit1 completed). This is
-            // the route SOURCE frontier ("maps you can run right now"). Cheap (2 derefs + 1 byte).
-            bool accessible = false, completed = false;
+            // Accessible/completed status: *(node+DataStorage)+DataModel → status byte. It is an ENUM, not a
+            // bitfield (Research --atlas-statusscan, live 2026-09-14 over 2008 nodes): 0 = completed,
+            // 1 = accessible (the runnable frontier — the route SOURCE set), 255 = locked / no state. The old
+            // bit decode read 255 as "accessible AND completed", which made ~85% of the atlas a route source
+            // and collapsed every auto-route to one hop. Cheap (2 derefs + 1 byte).
+            // Runnability is NOT stored here (adjacency test, Research --atlas-statusscan [7], live 2026-09-15:
+            // every non-completed neighbour of a completed map reads 255). It is DERIVED below from the
+            // graph — the game rule: not completed and touching a completed map.
+            bool accessible = false, completed = false; byte statusRaw = Poe2.AtlasNode.StatusLocked;
             var storage = Ptr(el + Poe2.AtlasNode.DataStorage);
             if (storage != 0)
             {
                 var model = Ptr(storage + Poe2.AtlasNode.DataModel);
                 if (model != 0 && _reader.TryReadStruct<byte>(model + Poe2.AtlasNode.DataStatus, out var stb))
-                { accessible = (stb & 1) != 0; completed = (stb & 2) != 0; }
+                { statusRaw = stb; completed = stb == Poe2.AtlasNode.StatusCompleted; }
             }
             // Resolved (cached): map name (all nodes) + rolled content tags (nodes with a +0x310 row).
             // Budget-limited per call so the first read doesn't hitch the tick; fills in over a few calls.
@@ -437,11 +444,23 @@ public sealed class Poe2Atlas
             var kind = Classify(resolved.code);   // map-archetype class (Citadel/Boss/Tower/Unique/Merchant/Normal) — first-class track target
             var meta = resolved.meta;             // offline maps.json classification (type/group/tags); default when unmapped
             outNodes.Add(new AtlasNodeLive(el, id, content, state, biome, flags, compl, x, y, w, h, scale, visible, iconType, gridX, gridY, resolved.map, resolved.code, resolved.content, accessible, completed, kind,
-                meta.Type ?? "", meta.Group ?? "", meta.Tags ?? NoTags));
+                meta.Type ?? "", meta.Group ?? "", meta.Tags ?? NoTags, statusRaw));
         }
         if (matched < 8) { Invalidate(); return false; }          // canvas no longer the node container
         AllTagsResolved = allCached;   // true once every node's tags are cached (seed defaults only then)
-        EnsureGraph();                 // (re)read the connection-edge vector once per canvas (cached)
+        EnsureGraph();                 // (re)read the connection-edge vector (rebuilt whenever it grows)
+        // Runnable ("accessible") = the game rule, derived from the graph: not completed AND adjacent to a
+        // completed map. Only nodes whose neighbours are LOADED can qualify, which is exactly right — the
+        // route sources must be in the graph anyway. (Caller holds _nodeLock; _graph is ours to read.)
+        var completedGrids = new HashSet<(int, int)>();
+        foreach (var n in outNodes) if (n.Completed) completedGrids.Add(n.Grid);
+        if (completedGrids.Count > 0)
+            for (var i = 0; i < outNodes.Count; i++)
+            {
+                var n = outNodes[i];
+                if (n.Completed || !_graph.TryGetValue(n.Grid, out var nbrs)) continue;
+                foreach (var nb in nbrs) if (completedGrids.Contains(nb)) { outNodes[i] = n with { Accessible = true }; break; }
+            }
         return true;
     }
 

@@ -2644,16 +2644,11 @@ public sealed class RadarApp : IDisposable
             var isNav = mNav != null;                     // Nav-to (route line)
             var isArrow = mArrow != null;                 // Arrow (off-screen pointer)
 
-            // Accessible/Completed come from a DEEP per-node model (Poe2Offsets.AtlasNode.DataStatus) that,
-            // as of 2026-09, reads a CONSTANT for "arbiter"-tagged boss-encounter nodes (Matriarch/Patriarch
-            // Halls, etc.) — proven live: an untouched farmable instance reads Completed=true while the
-            // one-time quest variant the player HAD already beaten read Completed=false. Both directions
-            // wrong, so the model plainly doesn't carry real per-node state for this content kind (probably
-            // a differently-shaped nodeData sub-struct where this offset is padding, not status). Don't let
-            // an untrustworthy read hide or de-prioritize content the player has never even seen.
-            var statusTrusted = !(n.MapDataTags?.Contains("arbiter", StringComparer.OrdinalIgnoreCase) ?? false);
-            var trustedCompleted = n.Completed && statusTrusted;
-            var trustedAccessible = n.Accessible && statusTrusted;
+            // (The 2026-09 "arbiter nodes read status backwards" workaround is gone: that was the status
+            // byte being decoded as a bitfield when it is an enum — see Poe2.AtlasNode.DataStatus. With the
+            // enum decode the untouched instance reads locked and the beaten quest variant reads completed.)
+            var trustedCompleted = n.Completed;
+            var trustedAccessible = n.Accessible;
 
             // #3 declutter: hide done maps (and optionally accessible-now ones). F10 route endpoints are
             // drawn separately (BuildAtlasRoute), so they survive. Completed maps are already nav-excluded.
@@ -2708,10 +2703,7 @@ public sealed class RadarApp : IDisposable
             var trackedSet = new HashSet<(int, int)>(trackedGrids);
             var sources = new List<(int, int)>();
             foreach (var n in nodes)
-            {
-                var trusted = !(n.MapDataTags?.Contains("arbiter", StringComparer.OrdinalIgnoreCase) ?? false);
-                if (n.Accessible && trusted && !trackedSet.Contains(n.Grid)) sources.Add(n.Grid);
-            }
+                if (n.Accessible && !trackedSet.Contains(n.Grid)) sources.Add(n.Grid);
             if (sources.Count == 0 && curGrid is { } c0 && _atlas.GraphHas(c0)) sources.Add(c0);
             if (sources.Count > 0)
             {
