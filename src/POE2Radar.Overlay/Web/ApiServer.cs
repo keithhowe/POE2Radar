@@ -59,6 +59,7 @@ public sealed class ApiServer : IDisposable
     private readonly Func<object>? _atlas;
     // Atlas node selection (element addresses) to highlight in-game; draw-only, loopback-gated.
     private readonly Action<IReadOnlyList<long>>? _atlasSelect;
+    private readonly Action<(int X, int Y)?>? _atlasRoute;
     // Atlas highlight rules (tag + colour + track/arrow) — only matching nodes draw in-game; loopback-gated.
     private readonly Action<IReadOnlyList<(string tag, string color, bool track, bool nav, bool arrow)>>? _atlasHighlight;
     // Version/update info provider ({current, latest, updateAvailable, url}) for the dashboard banner.
@@ -83,11 +84,13 @@ public sealed class ApiServer : IDisposable
         Action<IReadOnlyList<long>>? atlasSelect = null,
         Action<IReadOnlyList<(string tag, string color, bool track, bool nav, bool arrow)>>? atlasHighlight = null,
         Func<object>? versionProvider = null,
-        int port = 7777)
+        int port = 7777,
+        Action<(int X, int Y)?>? atlasRoute = null)
     {
         _state = state;
         _atlas = atlasProvider;
         _atlasSelect = atlasSelect;
+        _atlasRoute = atlasRoute;
         _atlasHighlight = atlasHighlight;
         _version = versionProvider;
         _settings = settings;
@@ -379,6 +382,30 @@ public sealed class ApiServer : IDisposable
                 break;
             }
 
+            case "/api/atlas-route":
+            {
+                // Set the atlas route destination by grid coord: {"grid":"x,y"}; {"clear":true} removes it.
+                // Draw-only (the overlay draws a line on the atlas screen); loopback-gated.
+                if (ctx.Request.HttpMethod != "POST") { Write(ctx, 405, JsonSerializer.Serialize(new { error = "method not allowed" }, Json)); break; }
+                if (!IsLoopbackHost(ctx.Request)) { Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json)); break; }
+                (int X, int Y)? grid = null; var clear = false;
+                try
+                {
+                    using var doc = JsonDocument.Parse(ReadBody(ctx));
+                    clear = doc.RootElement.TryGetProperty("clear", out var c) && c.ValueKind == JsonValueKind.True;
+                    if (doc.RootElement.TryGetProperty("grid", out var gv) && gv.ValueKind == JsonValueKind.String)
+                    {
+                        var parts = (gv.GetString() ?? "").Split(',');
+                        if (parts.Length == 2 && int.TryParse(parts[0].Trim(), out var gx) && int.TryParse(parts[1].Trim(), out var gy)) grid = (gx, gy);
+                    }
+                }
+                catch (JsonException) { }
+                if (!clear && grid is null) { Write(ctx, 400, JsonSerializer.Serialize(new { error = "expected {\"grid\":\"x,y\"} or {\"clear\":true}" }, Json)); break; }
+                _atlasRoute?.Invoke(clear ? null : grid);
+                Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, goal = clear ? null : $"{grid!.Value.X},{grid.Value.Y}" }, Json));
+                break;
+            }
+
             case "/api/atlas-highlight":
             {
                 // Set the active atlas highlight rules (content tags). Only matching nodes draw in-game.
@@ -509,6 +536,8 @@ public sealed class ApiServer : IDisposable
         // Atlas declutter / content-icon / route-chevron options + colour groups (#3/#4/#5/#7).
         atlasHideCompleted = _settings.AtlasHideCompleted,
         atlasHideAccessible = _settings.AtlasHideAccessible,
+        atlasShowRoute = _settings.AtlasShowRoute,
+        atlasAutoRoute = _settings.AtlasAutoRoute,
         atlasShowContentIcons = _settings.AtlasShowContentIcons,
         atlasContentIconSize = _settings.AtlasContentIconSize,
         atlasRouteArrowSpacing = _settings.AtlasRouteArrowSpacing,
@@ -558,6 +587,8 @@ public sealed class ApiServer : IDisposable
                 // Atlas declutter + content-icon + route-chevron options (#3/#4/#5).
                 case "atlasHideCompleted" when TryBool(p.Value, out var b): _settings.AtlasHideCompleted = b; applied.Add(p.Name); break;
                 case "atlasHideAccessible" when TryBool(p.Value, out var b): _settings.AtlasHideAccessible = b; applied.Add(p.Name); break;
+                case "atlasShowRoute" when TryBool(p.Value, out var b): _settings.AtlasShowRoute = b; applied.Add(p.Name); break;
+                case "atlasAutoRoute" when TryBool(p.Value, out var b): _settings.AtlasAutoRoute = b; applied.Add(p.Name); break;
                 case "atlasShowContentIcons" when TryBool(p.Value, out var b): _settings.AtlasShowContentIcons = b; applied.Add(p.Name); break;
                 case "atlasContentIconSize" when TryFloat(p.Value, out var f): _settings.AtlasContentIconSize = Math.Clamp(f, 12f, 64f); applied.Add(p.Name); break;
                 case "atlasRouteArrowSpacing" when TryFloat(p.Value, out var f): _settings.AtlasRouteArrowSpacing = Math.Clamp(f, 1.5f, 18f); applied.Add(p.Name); break;

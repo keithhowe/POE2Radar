@@ -487,9 +487,35 @@ internal static class DashboardHtml
             <div class="controls" id="atlasOpts" style="gap:14px;margin:0 0 8px;flex-wrap:wrap;font-size:12px">
               <label title="Hide maps you've already completed (declutter)"><input type="checkbox" data-atset="atlasHideCompleted"> Hide completed</label>
               <label title="Hide maps you can run right now"><input type="checkbox" data-atset="atlasHideAccessible"> Hide accessible</label>
+              <label title="Draw the ambient auto-routes to every nav-to tile. In-game hotkey: F11 (the manual route is not affected)"><input type="checkbox" data-atset="atlasAutoRoute"> Auto-routes (F11)</label>
+              <label title="Master switch for ALL atlas route drawing (auto-routes and the manual route)"><input type="checkbox" data-atset="atlasShowRoute"> Show routes</label>
               <label title="Draw in-game content art above tracked + fogged maps"><input type="checkbox" data-atset="atlasShowContentIcons"> Content icons</label>
               <label title="Content icon size (px)">Icon size <input type="number" data-atset="atlasContentIconSize" min="12" max="64" step="1" style="width:56px"></label>
               <label title="Spacing of the directional arrows along routes">Arrow spacing <input type="number" data-atset="atlasRouteArrowSpacing" min="1.5" max="18" step="0.5" style="width:56px"></label>
+            </div>
+
+            <!-- live nodes, sorted by distance: highlight one on the map, or route to it from where you are -->
+            <div id="atlasRouteBox" style="margin:0 0 10px;border:1px solid var(--line);border-radius:6px;padding:8px 10px">
+              <div class="controls" style="gap:10px;flex-wrap:wrap;align-items:center;font-size:12px;margin:0">
+                <b>Nodes by distance</b>
+                <span id="atlasRouteStatus" class="hint-row" style="opacity:.85">no destination</span>
+                <button class="chip" id="atlasRouteClear" title="Remove the manual route (also: 3rd F10 press in-game)">Clear route</button>
+                <button class="chip" id="atlasRouteUnhl" title="Clear the highlighted nodes">Clear highlights</button>
+              </div>
+              <div class="controls" style="gap:8px;flex-wrap:wrap;align-items:center;font-size:12px;margin:6px 0 0">
+                <input id="atlasRouteSearch" placeholder="filter map / content…" style="width:170px">
+                <select id="atlasRouteStatusSel" title="Status filter">
+                  <option value="reachable">Reachable</option>
+                  <option value="runnable">Runnable now</option>
+                  <option value="open">Not completed</option>
+                  <option value="done">Completed</option>
+                  <option value="all">All revealed</option>
+                </select>
+                <select id="atlasRouteKindSel" title="Map kind"><option value="">Any kind</option></select>
+                <select id="atlasRouteTagSel" title="Rolled content"><option value="">Any content</option></select>
+                <label title="Max hops from where you are">≤ hops <input type="number" id="atlasRouteMaxHops" min="0" max="99" step="1" value="" placeholder="∞" style="width:52px"></label>
+              </div>
+              <div id="atlasRouteList" style="max-height:320px;overflow:auto;margin-top:6px"></div>
             </div>
 
             <!-- active rules (removable chips) -->
@@ -1360,6 +1386,79 @@ function renderAtlas(){
   // Seed active rules from the overlay (once): tracked + arrow sets. Then render the filter table.
   if(atlasHl===null){ atlasHl=new Set((d.highlightTags||[]).map(t=>t.toLowerCase())); atlasNav=new Set((d.navTags||[]).map(t=>t.toLowerCase())); atlasArrow=new Set((d.arrowTags||[]).map(t=>t.toLowerCase())); }
   renderAtlasHighlight(d);
+  renderAtlasRouteList(d);
+}
+
+// "Route to a node": every live node the overlay can see, runnable-only by default. Clicking a row posts
+// it as the route DESTINATION; the overlay draws the shortest path from the player's current node (or the
+// nearest runnable map when the current-node marker isn't resolved) — the same line the in-game F10 flow
+// draws. The current destination row is highlighted; Clear removes the route.
+let atlasRouteWired=false;
+function fillSelect(sel, values, keep){
+  const cur=keep?sel.value:''; const first=sel.options[0].outerHTML;
+  sel.innerHTML=first+values.map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
+  if([...sel.options].some(o=>o.value===cur)) sel.value=cur;
+}
+function renderAtlasRouteList(d){
+  const box=$('#atlasRouteList'); if(!box) return;
+  if(!atlasRouteWired){
+    atlasRouteWired=true;
+    ['#atlasRouteSearch','#atlasRouteMaxHops'].forEach(id=>$(id).oninput=()=>renderAtlasRouteList(atlasData));
+    ['#atlasRouteStatusSel','#atlasRouteKindSel','#atlasRouteTagSel'].forEach(id=>$(id).onchange=()=>renderAtlasRouteList(atlasData));
+    $('#atlasRouteClear').onclick=()=>postAtlasRoute(null);
+    $('#atlasRouteUnhl').onclick=()=>{ atlasSel.clear(); postAtlasSel(); renderAtlasRouteList(atlasData); };
+  }
+  const all=(d.nodeList||[]).filter(n=>n.map);
+  const goal=d.routeGoal||null, start=d.routeStart||null;
+  const byGrid=new Map(all.map(n=>[n.grid,n]));
+  const name=g=>{ const n=g&&byGrid.get(g); return n?(n.map||g):g; };
+  $('#atlasRouteStatus').innerHTML = goal
+    ? 'route to <b>'+esc(name(goal))+'</b> <span class="amono">('+esc(goal)+')</span>'+(start?' from <b>'+esc(name(start))+'</b>':' · no path yet')
+    : 'no route — click ⇢ on a row · ☆ highlights it on the map';
+  // Filter option lists come from the live data (kinds + rolled content actually present).
+  fillSelect($('#atlasRouteKindSel'), [...new Set(all.map(n=>n.kind).filter(Boolean))].sort(), true);
+  fillSelect($('#atlasRouteTagSel'), [...new Set(all.flatMap(n=>n.tags||[]))].sort(), true);
+
+  const f=($('#atlasRouteSearch').value||'').trim().toLowerCase();
+  const stf=$('#atlasRouteStatusSel').value, kf=$('#atlasRouteKindSel').value, tf=$('#atlasRouteTagSel').value;
+  const mh=parseInt($('#atlasRouteMaxHops').value,10);
+  let list=all;
+  if(stf==='reachable') list=list.filter(n=>n.hops!=null && !n.completed);
+  else if(stf==='runnable') list=list.filter(n=>n.accessible);
+  else if(stf==='open') list=list.filter(n=>!n.completed);
+  else if(stf==='done') list=list.filter(n=>n.completed);
+  else list=list.filter(n=>n.visible||n.accessible||n.completed||n.hops!=null);
+  if(kf) list=list.filter(n=>n.kind===kf);
+  if(tf) list=list.filter(n=>(n.tags||[]).includes(tf));
+  if(!isNaN(mh)) list=list.filter(n=>n.hops!=null && n.hops<=mh);
+  if(f) list=list.filter(n=>(n.map||'').toLowerCase().includes(f)||(n.kind||'').toLowerCase().includes(f)||(n.tags||[]).some(t=>t.toLowerCase().includes(f))||(n.dataTags||[]).some(t=>t.toLowerCase().includes(f)));
+  // Distance first (unreachable last), then runnable, then name.
+  list.sort((a,b)=>((a.hops==null?1e9:a.hops)-(b.hops==null?1e9:b.hops)) || (b.accessible?1:0)-(a.accessible?1:0) || (a.map||'').localeCompare(b.map||''));
+  if(list.length===0){ box.innerHTML='<div class="hint-row">'+(all.length?'No nodes match these filters.':'No live nodes — open the Atlas in-game, then Refresh.')+'</div>'; return; }
+  const cell='display:grid;grid-template-columns:28px 28px 52px minmax(150px,2fr) 84px 76px 1fr;gap:8px;align-items:center;padding:4px 8px';
+  box.innerHTML='<div style="'+cell+';font-weight:600;font-size:11px;text-transform:uppercase;opacity:.7;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel,#1a1a1a)">'
+    +'<span title="Highlight on the map">☆</span><span title="Route from where you are">⇢</span><span>Hops</span><span>Map</span><span>Status</span><span>Grid</span><span>Content</span></div>'
+    +list.slice(0,800).map(n=>{
+      const st=n.accessible?'<span class="ntag tc" style="color:#3ddc97">runnable</span>':n.completed?'<span class="ntag">done</span>':n.hops!=null?'<span class="ntag" style="opacity:.7">'+n.hops+' away</span>':'<span class="ntag" style="opacity:.5">locked</span>';
+      const isGoal=goal===n.grid, hl=atlasSel.has(n.el);
+      return '<div class="rt-row" data-grid="'+esc(n.grid)+'" data-el="'+esc(n.el)+'" style="'+cell+';border-bottom:1px solid var(--line)'+(isGoal?';background:rgba(60,220,255,.16);outline:1px solid var(--edge,#3cdcff)':hl?';background:rgba(255,200,60,.12)':'')+'">'
+        +'<span class="rt-hl" title="highlight this node on the map (toggle)" style="cursor:pointer;font-size:15px;color:'+(hl?'#e0b341':'#4a525c')+'">'+(hl?'★':'☆')+'</span>'
+        +'<span class="rt-go" title="route here from where you are (click again to clear)" style="cursor:pointer;font-size:16px;color:'+(isGoal?'#3cdcff':'#3ddc97')+'">⇢</span>'
+        +'<span class="amono">'+(n.hops==null?'—':n.hops)+'</span>'
+        +'<span>'+esc(n.map)+(n.kind&&n.kind!=='Normal'?' <span class="ntag">'+esc(n.kind)+'</span>':'')+'</span>'
+        +'<span>'+st+'</span><span class="amono">'+esc(n.grid)+'</span>'
+        +'<span>'+((n.tags||[]).map(t=>'<span class="ntag tc">'+esc(t)+'</span>').join(' ')||'<span style="opacity:.4">—</span>')+'</span></div>';
+    }).join('')
+    +(list.length>800?'<div class="hint-row">…'+(list.length-800)+' more (narrow the filters)</div>':'');
+  $$('#atlasRouteList .rt-row').forEach(r=>{
+    r.querySelector('.rt-go').onclick=()=>postAtlasRoute(r.dataset.grid===goal?null:r.dataset.grid);
+    r.querySelector('.rt-hl').onclick=()=>{ const el=r.dataset.el; if(atlasSel.has(el)) atlasSel.delete(el); else atlasSel.add(el); postAtlasSel(); renderAtlasRouteList(atlasData); };
+  });
+}
+async function postAtlasRoute(grid){
+  try{ await fetch('/api/atlas-route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(grid?{grid}:{clear:true})}); }catch(e){}
+  // Give the world thread a tick to solve the path, then re-read so the status line shows the start.
+  setTimeout(loadAtlas,350);
 }
 // Biome index → friendly-ish label (best-effort; index is the ground truth).
 const BIOMES=['Grass','Sand','Swamp','Forest','Snow','Stone','Volcanic','Coast','Cave','Vaal','Water','Desert','Special'];

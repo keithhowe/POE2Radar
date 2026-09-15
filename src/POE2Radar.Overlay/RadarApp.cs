@@ -140,6 +140,7 @@ public sealed class RadarApp : IDisposable
     private readonly object _atlasLock = new();
     private readonly HashSet<nint> _atlasSel = new();   // selected node element addresses (from the dashboard)
     private DateTime _nextInspectAt = DateTime.MinValue; // F10 hotkey debounce (render thread)
+    private DateTime _nextRouteToggleAt = DateTime.MinValue; // F11 atlas-route toggle debounce (render thread)
     // F10 route workflow (manual, no memory-marker dependency): 1st F10 sets START tile, 2nd sets END tile
     // (and routes between them through the connection graph), 3rd resets. Stored by GRID coord so they
     // survive pan/zoom and the tiles going off-screen. Written by F10 (render thread), read by UpdateAtlas
@@ -581,13 +582,14 @@ public sealed class RadarApp : IDisposable
         Console.WriteLine($"Hidden entities: {_hidden.Count} pattern(s); display rules: {_displayRules.Count}; known mods: {_modCatalog.Count}");
         _api = new ApiServer(() => _state, _settings, GetNavSelection, ToggleNavTarget, ClearNavSelection,
                              _hidden, _displayRules, _landmarkStore, CurrentTilePaths, () => _modCatalog.All, PricesJson, AtlasJson, SetAtlasSelection,
-                             SetAtlasHighlight, VersionJson, _settings.ApiPort);
+                             SetAtlasHighlight, VersionJson, _settings.ApiPort, SetAtlasDestination);
         try { _api.Start(); Console.WriteLine($"API on http://localhost:{_settings.ApiPort} (dashboard at /)"); }
         catch (Exception ex) { Console.Error.WriteLine($"API server disabled: {ex.Message}"); }
         Console.WriteLine("Hotkeys: F6=add nearest path target  F7=clear path targets  "
                           + "F8=auto-flask  F9=quit  F12=open dashboard");
         Console.WriteLine("         F10 (Atlas open) = inspect hovered tile (dumps map name + code + content"
                           + " to console for web-UI filters) and set route START->END (3rd press resets)");
+        Console.WriteLine("         F11 = hide/show the atlas AUTO-routes (nav-to selections are kept; the manual route stays)");
         // Best-effort version check against GitHub (non-blocking; never fails startup).
         _ = Task.Run(async () =>
         {
@@ -1779,6 +1781,19 @@ public sealed class RadarApp : IDisposable
             _settings.Save();
             Console.WriteLine($"\nAuto-flask: {(_autoFlask ? "ON" : "OFF")}");
         }
+        // F11 toggles the AUTO-routes (the ambient routes to every nav-to tile) without touching the nav-to
+        // selections, so a second press brings the same routes back. The manual route (F10 / dashboard
+        // "Route") is deliberately NOT affected — that one is the route you asked for. Persists.
+        if (Down(0x7A) && DateTime.UtcNow >= _nextRouteToggleAt)
+        {
+            _nextRouteToggleAt = DateTime.UtcNow.AddMilliseconds(300);
+            _settings.AtlasAutoRoute = !_settings.AtlasAutoRoute;
+            // Turning auto-routes ON must actually show them: the master AtlasShowRoute gate (an earlier
+            // F11 binding used to flip it and persist it off) would otherwise silently swallow every route.
+            if (_settings.AtlasAutoRoute && !_settings.AtlasShowRoute) { _settings.AtlasShowRoute = true; Console.WriteLine("\n(atlas route drawing was OFF in settings — re-enabled)"); }
+            _settings.Save();
+            Console.WriteLine($"\nAtlas auto-routes: {(_settings.AtlasAutoRoute ? "SHOWN" : "HIDDEN")}  (F11 toggles; the manual route stays)");
+        }
         // F9 quits the overlay (besides the tray-icon Exit).
         if (Down(0x78)) { Console.WriteLine("\nF9 — exiting."); RequestShutdown(); }
 
@@ -2367,9 +2382,28 @@ public sealed class RadarApp : IDisposable
         // Live node graph (atlas nodes are UiElements) — summary + the locally-visible highlight set.
         var nodes = _inGameStateForApi != 0 ? _atlas.ReadNodes(_inGameStateForApi) : new List<Poe2Atlas.AtlasNodeLive>();
         var vis = nodes.Where(n => n.Visible).ToList();
+        (int X, int Y)? rGoal, rStart; lock (_atlasLock) { rGoal = _atlasGoalGrid; rStart = _atlasStartGrid; }
+        rStart ??= _atlasRouteStartResolved;
+        // Hop distance from "where you are" to EVERY node, for the dashboard's distance-sorted list: one
+        // multi-source BFS seeded from the current node (when the marker resolves) or the runnable frontier.
+        var hopsByGrid = new Dictionary<(int, int), int>();
+        if (nodes.Count > 0)
+        {
+            var srcs = new List<(int, int)>();
+            if (_atlas.CurrentNodeGrid() is { } cgh && _atlas.GraphHas(cgh)) srcs.Add(cgh);
+            else foreach (var n in nodes) if (n.Accessible) srcs.Add(n.Grid);
+            if (srcs.Count > 0)
+            {
+                var goals = new HashSet<(int, int)>(); foreach (var n in nodes) goals.Add(n.Grid);
+                foreach (var kv in _atlas.RoutesFromSources(srcs, goals)) hopsByGrid[kv.Key] = kv.Value.Count - 1;
+            }
+        }
         return new
         {
             located = d.Located,
+            // Manual / dashboard route endpoints (grid coords as "x,y"; null when unset).
+            routeGoal = rGoal is { } rg ? $"{rg.X},{rg.Y}" : null,
+            routeStart = rStart is { } rs ? $"{rs.X},{rs.Y}" : null,
             note = d.Note,
             catalogAddr = $"0x{d.CatalogAddr:X}",
             catalogCount = d.CatalogCount,
@@ -2439,6 +2473,9 @@ public sealed class RadarApp : IDisposable
                     id = n.Id, biome = (int)n.Biome, type = n.IconType, hasContent = n.HasContent,
                     unlocked = n.Unlocked, visited = n.Visited, visible = n.Visible,
                     accessible = n.Accessible, completed = n.Completed, kind = n.Kind,
+                    grid = $"{n.Grid.Item1},{n.Grid.Item2}",   // routing key (matches routeGoal / /api/atlas-route)
+                    hops = hopsByGrid.TryGetValue(n.Grid, out var hp) ? hp : (int?)null,   // distance from current node / frontier; null = unreachable
+                    dataTags = n.MapDataTags,
                     x = (int)n.X, y = (int)n.Y, map = n.MapName, tags = n.Tags,
                 }),
         };
@@ -2722,7 +2759,24 @@ public sealed class RadarApp : IDisposable
             }
         }
 
-        var (start, end, route) = BuildAtlasRoute(nodes, startGrid, goalGrid);
+        // A destination set WITHOUT a start (dashboard "Route to" click, or an F10 END with the START since
+        // cleared) routes from the player's current node when the marker resolves, otherwise from whichever
+        // runnable-now map reaches it in the fewest hops — the same frontier the auto-routes use.
+        var effStart = startGrid;
+        if (effStart is null && goalGrid is { } goalG)
+        {
+            if (curGrid is { } cg1 && _atlas.GraphHas(cg1)) effStart = cg1;
+            else
+            {
+                var frontier = new List<(int, int)>();
+                foreach (var n in nodes) if (n.Accessible && n.Grid != goalG) frontier.Add(n.Grid);
+                if (frontier.Count > 0 && _atlas.RoutesFromSources(frontier, new[] { goalG }).TryGetValue(goalG, out var best) && best.Count > 0)
+                    effStart = best[0];
+            }
+            _atlasRouteStartResolved = effStart;
+        }
+        else _atlasRouteStartResolved = null;
+        var (start, end, route) = BuildAtlasRoute(nodes, effStart, goalGrid);
         _atlasRender = new AtlasRender(true, marks, start, end, route, currentPt, autoRoutes);   // publish atomically
     }
 
@@ -2767,6 +2821,16 @@ public sealed class RadarApp : IDisposable
     {
         lock (_atlasLock) { _atlasSel.Clear(); foreach (var e in els) _atlasSel.Add((nint)e); }
     }
+
+    /// <summary>API: set (or clear, with null) the atlas route DESTINATION by grid coord — the dashboard's
+    /// "Route to" click. Clears any manual F10 START so the route re-originates from the player's current
+    /// node / the runnable frontier (see UpdateAtlas). Draw-only; safe to call from the API thread.</summary>
+    public void SetAtlasDestination((int X, int Y)? grid)
+    {
+        lock (_atlasLock) { _atlasGoalGrid = grid; _atlasStartGrid = null; }
+        Console.WriteLine(grid is { } g ? $"\n[atlas route] dashboard: END = {g} (routing from current node / runnable frontier)" : "\n[atlas route] dashboard: route cleared");
+    }
+    private (int X, int Y)? _atlasRouteStartResolved;   // the start UpdateAtlas picked for a start-less destination (for the dashboard)
 
     /// <summary>API: set the active atlas highlight rules (tag + ring colour). Only nodes whose content
     /// tags or map name match one of these are drawn in-game, in the rule's colour. Persisted; applied on
