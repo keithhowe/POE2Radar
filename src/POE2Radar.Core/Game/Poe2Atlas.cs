@@ -927,8 +927,13 @@ public sealed class Poe2Atlas
         //
         // GridPos is the durable signature: every atlas node owns a DISTINCT (int,int) map coordinate in
         // a small range. Real class = 512 instances / 512 distinct coords; the impostor = 4678 in-range
-        // but only 53 distinct. Ranking by distinct-coordinate count separates them by ~10x.
-        nint bestVt = 0; var bestDistinct = 0;
+        // but only 53 distinct. Ranking by distinct-coordinate count separates them by ~10x... usually.
+        // Observed live 2026-09-15: a ~5312-instance decorative class can ALSO clear that bar purely on
+        // volume (more instances → more coincidentally-distinct in-range int pairs), and since raw
+        // coords.Count scales with instance count it can outrank the true ~1000-node atlas class. GridPos
+        // alone is necessary but not sufficient — cross-check with GRAPH CONNECTIVITY (a real atlas class
+        // is densely connected via AtlasGraph.ConnectionsVec; decorative noise is not) before committing.
+        var ranked = new List<(nint vt, List<nint> list, HashSet<(int, int)> coords)>();
         foreach (var (vt, list) in byVtable)
         {
             if (list.Count < 50) continue;
@@ -938,26 +943,68 @@ public sealed class Poe2Atlas
             {
                 if (!_reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx)) continue;
                 if (!_reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy)) continue;
-                if (gx is < -64 or > 64 || gy is < 0 or > 192) continue;
+                if (gx is < -512 or > 512 || gy is < -512 or > 512) continue;
                 inRange++; coords.Add((gx, gy));
             }
             // Require the coords to be genuinely per-node, not a handful of repeated values.
             if (inRange < list.Count * 0.5 || coords.Count < 20) continue;
-            if (coords.Count > bestDistinct) { bestDistinct = coords.Count; bestVt = vt; }
+            ranked.Add((vt, list, coords));
         }
-        if (bestVt == 0) return false;
-        _nodeVtable = bestVt;
-        // The node-class elements also appear OUTSIDE the atlas (terrain props / minimap), so the
-        // first one's parent isn't necessarily the node canvas. The real atlas canvas is the parent
-        // that holds the MOST node-class children — pick that (443 nodes vs a few terrain props).
-        var parentCount = new Dictionary<nint, int>();
-        foreach (var el in byVtable[bestVt])
+        if (ranked.Count == 0) return false;
+        ranked.Sort((a, b) => b.coords.Count - a.coords.Count);
+
+        nint bestVt = 0, bestCanvas = 0;
+        (nint vt, nint canvas, int connected)? bestFallbackConn = null;
+        foreach (var (vt, list, coords) in ranked.Take(8))   // cap: this only runs on a throttled (re)detect
         {
-            var p = Ptr(el + Poe2.UiElement.Parent);
-            if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1;
+            // The node-class elements also appear OUTSIDE the atlas (terrain props / minimap), so the
+            // first one's parent isn't necessarily the node canvas. The real atlas canvas is the parent
+            // that holds the MOST node-class children — pick that (443 nodes vs a few terrain props).
+            var parentCount = new Dictionary<nint, int>();
+            foreach (var el in list)
+            {
+                var p = Ptr(el + Poe2.UiElement.Parent);
+                if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1;
+            }
+            if (parentCount.Count == 0) continue;
+            var canvas = parentCount.OrderByDescending(k => k.Value).First().Key;
+
+            // Connectivity check: read the canvas's edge vector at the COMMITTED offset (cheap — no
+            // brute-force scan needed, we already trust AtlasGraph.ConnectionsVec) and see what fraction
+            // of THIS candidate's own coords participate in at least one valid edge. Real atlas graphs are
+            // sparse but broadly connected; decorative noise has near-zero genuine edges.
+            var connected = new HashSet<(int, int)>();
+            var begin = Ptr(canvas + Poe2.AtlasGraph.ConnectionsVec);
+            if (begin != 0 && _reader.TryReadStruct<nint>(canvas + Poe2.AtlasGraph.ConnectionsVec + 8, out var end) && end > begin)
+            {
+                var edgeBytes = (long)end - (long)begin;
+                var edgeCount = edgeBytes / Poe2.AtlasGraph.EdgeStride;
+                if (edgeCount is > 0 and <= 200_000)
+                {
+                    for (long i = 0; i < edgeCount; i++)
+                    {
+                        var e = begin + (nint)(i * Poe2.AtlasGraph.EdgeStride);
+                        if (!_reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff, out var sx)) continue;
+                        if (!_reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff + 4, out var sy)) continue;
+                        if (!_reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff, out var dx)) continue;
+                        if (!_reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff + 4, out var dy)) continue;
+                        if (coords.Contains((sx, sy)) && coords.Contains((dx, dy))) { connected.Add((sx, sy)); connected.Add((dx, dy)); }
+                    }
+                }
+            }
+            if (bestFallbackConn == null || connected.Count > bestFallbackConn.Value.connected)
+                bestFallbackConn = (vt, canvas, connected.Count);
+            if (connected.Count < coords.Count * 0.3) continue;   // near-disconnected — not the real atlas class
+            bestVt = vt; bestCanvas = canvas; break;
         }
-        if (parentCount.Count == 0) return false;
-        _nodeCanvas = parentCount.OrderByDescending(k => k.Value).First().Key;
+        // No candidate cleared the 30% bar — use the least-bad one ONLY if it showed ANY real graph
+        // connectivity at all (zero connected coords, as in the ~5312-instance decorative-class case
+        // observed live 2026-09-15, means "definitely not it" — better to report not-found and retry
+        // next detection cycle than commit to a canvas with no route graph on it whatsoever).
+        if (bestVt == 0 && bestFallbackConn is { connected: > 0 } fb) { bestVt = fb.vt; bestCanvas = fb.canvas; }
+        if (bestVt == 0 || bestCanvas == 0) return false;
+        _nodeVtable = bestVt;
+        _nodeCanvas = bestCanvas;
 
         // Current-location marker: the lone NON-node element whose +0x300 points at a node-class element
         // (*(marker+0x300) = the node the player is currently in). Structural, so no vtable to drift. The BFS

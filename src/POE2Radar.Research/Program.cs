@@ -366,6 +366,15 @@ if (HasFlag(args, "--atlas-resolve"))
 if (HasFlag(args, "--atlas-graph"))
     return RunAtlasGraph(process, reader);
 
+if (HasFlag(args, "--atlas-status"))
+    return RunAtlasStatus(process, reader);
+
+if (TryGetStrArg(args, "--atlas-node-find") is { } nodeNeedle)
+    return RunAtlasNodeFind(process, reader, nodeNeedle);
+
+if (HasFlag(args, "--atlas-fog"))
+    return RunAtlasFog(process, reader);
+
 if (HasFlag(args, "--atlas-mapname"))
     return RunAtlasMapName(process, reader, TryGetIntArg(args, "--max") ?? 12);
 
@@ -7950,6 +7959,259 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
     return 0;
 }
 
+// ── Atlas STATUS byte discovery: AtlasNode.DataStatus (nodeData+0x2BC) reads a CONSTANT on the live
+//    2026-09-14 build, so the routing "accessible frontier" (RadarApp: sources = nodes where
+//    n.Accessible) is empty and no route can ever compute. The element-level AtlasNode.Flags bit0
+//    (Unlocked) is separately confirmed working (real, non-constant distribution) via /api/atlas.
+//    Rather than blind byte-scanning nodeData (which mixes heterogeneous node-kind sub-structs and
+//    produces noise), CORRELATE each candidate byte against the already-trusted Unlocked bit: the
+//    real status field's value sets for Unlocked=true vs Unlocked=false must be disjoint (a locked
+//    node cannot also read "accessible/completed", and vice versa). Run with the Atlas map open. ──
+static int RunAtlasStatus(ProcessHandle process, MemoryReader reader)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
+    Console.WriteLine("ATLAS STATUS BYTE DISCOVERY — correlate nodeData bytes against the trusted Unlocked flag\n===========================================================================================");
+
+    var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: atlas-node class not found ({nodes.Count} instances). Open the Atlas MAP view, then re-run."); return 1; }
+    Console.WriteLine($"[0] node class 0x{vt:X}  canvas 0x{canvas:X}  ({nodes.Count} node instances)\n");
+
+    var samples = new List<(nint data, bool unlocked, bool visited)>();
+    foreach (var el in nodes)
+    {
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var flagByte);
+        var unlocked = (flagByte & 0x01) != 0;
+        var visited = (flagByte & 0x02) != 0;
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+        var data = storage != 0 ? SafePtr(reader, storage + Poe2.AtlasNode.DataModel) : 0;
+        if (data != 0) samples.Add((data, unlocked, visited));
+    }
+    var nUnlocked = samples.Count(s => s.unlocked);
+    var nLocked = samples.Count(s => !s.unlocked);
+    Console.WriteLine($"[1] elem Flags (+0x{Poe2.AtlasNode.Flags:X3}) ground truth: {nUnlocked} unlocked, {nLocked} locked, {samples.Count(s => s.visited)} visited, out of {samples.Count} resolved nodeData ptrs\n");
+    if (nUnlocked == 0 || nLocked == 0) { Console.WriteLine("    ⚠ Flags itself has no variety here — can't correlate. Try a different area of the atlas."); return 1; }
+
+    Console.WriteLine("[2] candidate byte offsets where Unlocked/Locked value-sets are DISJOINT (committed DataStatus=+0x2BC for reference):");
+    var found = false;
+    for (var o = 0x200; o <= 0x310; o++)
+    {
+        var valsUnlocked = new HashSet<byte>(); var valsLocked = new HashSet<byte>();
+        foreach (var (data, unlocked, _) in samples)
+            if (reader.TryReadStruct<byte>(data + o, out var b)) { if (unlocked) valsUnlocked.Add(b); else valsLocked.Add(b); }
+        if (valsUnlocked.Count == 0 || valsLocked.Count == 0) continue;
+        if (valsUnlocked.Overlaps(valsLocked)) continue;               // not disjoint — same values appear in both groups
+        if (valsUnlocked.Count + valsLocked.Count > 6) continue;       // too many distinct values for a status enum
+        found = true;
+        Console.WriteLine($"    +0x{o:X3}{(o == Poe2.AtlasNode.DataStatus ? " (committed)" : "")}  unlocked→{{{string.Join(",", valsUnlocked.OrderBy(v => v))}}}  locked→{{{string.Join(",", valsLocked.OrderBy(v => v))}}}");
+
+        // Full breakdown with counts + cross-tab against Visited, so a value like 255 can be checked
+        // against "has this map actually been completed" rather than just "is it unlocked".
+        var hist = new Dictionary<(byte val, bool unlocked, bool visited), int>();
+        foreach (var (data, unlocked, visited) in samples)
+            if (reader.TryReadStruct<byte>(data + o, out var b))
+            { var key = (b, unlocked, visited); hist[key] = hist.GetValueOrDefault(key) + 1; }
+        foreach (var kv in hist.OrderBy(k => k.Key.val))
+            Console.WriteLine($"        val={kv.Key.val,3}  unlocked={kv.Key.unlocked,-5} visited={kv.Key.visited,-5} → x{kv.Value}");
+    }
+    if (!found) Console.WriteLine("    (none found in +0x200..+0x310 — try widening the range, or the field may not be byte-sized)");
+    return 0;
+}
+
+// ── Find a specific atlas node by (partial, case-insensitive) display name or internal map code, and
+//    dump everything relevant to why routing might not reach it: GridPos, DataStatus decode, elem
+//    Unlocked/Visited, and its GRAPH DEGREE (edges touching its grid coord) — a node with degree 0 is
+//    graph-isolated and no A* route can ever reach it regardless of accessible/completed status. ──
+static int RunAtlasNodeFind(ProcessHandle process, MemoryReader reader, string needle)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
+    Console.WriteLine($"ATLAS NODE FIND — \"{needle}\"\n================================");
+
+    var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: atlas-node class not found ({nodes.Count} instances). Open the Atlas MAP view, then re-run."); return 1; }
+    Console.WriteLine($"[0] node class 0x{vt:X}  canvas 0x{canvas:X}  ({nodes.Count} node instances)\n");
+
+    // Build the grid-position set once (needed to validate/score the connection edge vector below).
+    var gridSet = new HashSet<(int, int)>();
+    var gridByEl = new Dictionary<nint, (int, int)>();
+    foreach (var el in nodes)
+        if (reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx) && reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy))
+        { gridSet.Add((gx, gy)); gridByEl[el] = (gx, gy); }
+
+    // Locate the connection edge vector the same way --atlas-graph does (canvas + up to 3 ancestors,
+    // scanning +0x400..+0x800 for a StdVector whose edges land on real grid positions).
+    var containers = new List<(string label, nint addr)> { ("canvas", canvas) };
+    { var cur = canvas; for (var i = 0; i < 3; i++) { var p = SafePtr(reader, cur + Poe2.UiElement.Parent); if (p == 0 || p == cur) break; containers.Add(($"canvas.parent[{i + 1}]", p)); cur = p; } }
+    (nint who, int off, int stride, int edges) bestConn = (0, -1, 0, 0);
+    var bestValid = 0;
+    foreach (var (_, addr) in containers)
+    {
+        if (addr == 0) continue;
+        for (var o = 0x400; o <= 0x800; o += 8)
+        {
+            var begin = SafePtr(reader, addr + o);
+            if (!reader.TryReadStruct<nint>(addr + o + 8, out var end) || begin == 0 || end <= begin) continue;
+            var bytes = (long)end - (long)begin;
+            if (bytes is < 20 or > 20_000_000) continue;
+            foreach (var stride in new[] { 20, 24, 16 })
+            {
+                if (bytes % stride != 0) continue;
+                var count = (int)(bytes / stride);
+                if (count is < 8 or > 200000) continue;
+                int valid = 0, tested = 0;
+                for (var i = 0; i < count && tested < 200; i++)
+                {
+                    var e = begin + (nint)(i * stride); tested++;
+                    if (!reader.TryReadStruct<int>(e + 4, out var sx) || !reader.TryReadStruct<int>(e + 8, out var sy)) continue;
+                    if (!reader.TryReadStruct<int>(e + 12, out var dx) || !reader.TryReadStruct<int>(e + 16, out var dy)) continue;
+                    if (gridSet.Contains((sx, sy)) && gridSet.Contains((dx, dy))) valid++;
+                }
+                if (valid > bestValid && valid >= tested / 2) { bestValid = valid; bestConn = (addr, o, stride, count); }
+            }
+        }
+    }
+    var degree = new Dictionary<(int, int), int>();
+    if (bestConn.off >= 0)
+    {
+        var begin = SafePtr(reader, bestConn.who + bestConn.off);
+        for (var i = 0; i < bestConn.edges; i++)
+        {
+            var e = begin + (nint)(i * bestConn.stride);
+            if (!reader.TryReadStruct<int>(e + 4, out var sx) || !reader.TryReadStruct<int>(e + 8, out var sy)) continue;
+            if (!reader.TryReadStruct<int>(e + 12, out var dx) || !reader.TryReadStruct<int>(e + 16, out var dy)) continue;
+            if (!gridSet.Contains((sx, sy)) || !gridSet.Contains((dx, dy))) continue;
+            degree[(sx, sy)] = degree.GetValueOrDefault((sx, sy)) + 1;
+            degree[(dx, dy)] = degree.GetValueOrDefault((dx, dy)) + 1;
+        }
+    }
+    Console.WriteLine($"[1] connection graph: {(bestConn.off >= 0 ? $"found, {degree.Count} nodes with >=1 edge" : "NOT FOUND")}\n");
+
+    var matches = 0;
+    foreach (var el in nodes)
+    {
+        // Rolled map code (mirrors Poe2Atlas.ReadRolledMapCode): DataStorage -> DataModel -> up to 4
+        // hops from +DataMapId for a "Map…" string.
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+        var data = storage != 0 ? SafePtr(reader, storage + Poe2.AtlasNode.DataModel) : 0;
+        string code = "";
+        if (data != 0)
+        {
+            var cur = data + Poe2.AtlasNode.DataMapId;
+            for (var hop = 0; hop < 4 && cur != 0; hop++)
+            {
+                var s = reader.ReadStringUtf16(cur, 64);
+                if (s.StartsWith("Map", StringComparison.Ordinal)) { code = s; break; }
+                cur = SafePtr(reader, cur);
+            }
+        }
+        var meta = AtlasMapData.Shared.Get(code);
+        var displayName = meta?.Name ?? "";
+        if (code.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0 && displayName.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) continue;
+        matches++;
+
+        gridByEl.TryGetValue(el, out var grid);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var flagByte);
+        var unlocked = (flagByte & 0x01) != 0; var visited = (flagByte & 0x02) != 0;
+        byte status = 0; var statusOk = data != 0 && reader.TryReadStruct<byte>(data + Poe2.AtlasNode.DataStatus, out status);
+        var accessible = statusOk && (status & 1) != 0; var completed = statusOk && (status & 2) != 0;
+        var deg = degree.GetValueOrDefault(grid);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var stateByte);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Completion, out var completionByte);
+        reader.TryReadStruct<uint>(el + Poe2.AtlasNode.MapNodeId, out var mapNodeId);
+
+        Console.WriteLine($"    el=0x{el:X}  code=\"{code}\"  name=\"{displayName}\"  type={meta?.Type}  tags=[{string.Join(",", meta?.Tags ?? Array.Empty<string>())}]");
+        Console.WriteLine($"        grid=({grid.Item1},{grid.Item2})  inGridSet={gridSet.Contains(grid)}  graphDegree={deg}{(deg == 0 ? "  ⚠ ISOLATED — no A* route can reach this node regardless of status" : "")}");
+        Console.WriteLine($"        DataStatus byte={status} (ok={statusOk}) -> accessible={accessible} completed={completed}   elem Flags=0x{flagByte:X2} -> unlocked={unlocked} visited={visited}");
+        Console.WriteLine($"        elem State(+0x32C)={stateByte}  Completion(+0x339)={completionByte}  MapNodeId(+0x300)={mapNodeId}");
+    }
+    if (matches == 0) Console.WriteLine($"    no node's rolled code or offline display name matched \"{needle}\". Try a shorter/different substring, or the tile may not be on the currently-open atlas region.");
+    return 0;
+}
+
+// ── FOG diagnostic: how many atlas nodes have a resolvable map identity RIGHT NOW vs how many come
+//    back blank. If PoE2 only assigns a node's content once you've been near/revealed it (true
+//    server-side fog, not just a client-side visual mask), unresolved nodes are unresolvable by ANY
+//    memory-reading trick until revealed — this tells us which case we're in before chasing offsets
+//    further. Tries the PRIMARY (nodeData rolled-map) path and the LEGACY (MapNodeId→WorldAreas row)
+//    path independently, and dumps raw content for a sample of nodes that resolve NEITHER. ──
+static int RunAtlasFog(ProcessHandle process, MemoryReader reader)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
+    Console.WriteLine("ATLAS FOG DIAGNOSTIC — primary vs legacy map-identity resolution\n=================================================================");
+
+    var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: atlas-node class not found ({nodes.Count} instances). Open the Atlas MAP view, then re-run."); return 1; }
+    Console.WriteLine($"[0] node class 0x{vt:X}  canvas 0x{canvas:X}  ({nodes.Count} node instances)\n");
+
+    int primaryOk = 0, legacyOk = 0, neither = 0, unlockedNeither = 0, lockedNeither = 0;
+    var neitherSample = new List<nint>();
+    foreach (var el in nodes)
+    {
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+        var data = storage != 0 ? SafePtr(reader, storage + Poe2.AtlasNode.DataModel) : 0;
+        string primary = "";
+        if (data != 0)
+        {
+            var cur = data + Poe2.AtlasNode.DataMapId;
+            for (var hop = 0; hop < 4 && cur != 0; hop++)
+            {
+                var s = reader.ReadStringUtf16(cur, 64);
+                if (s.StartsWith("Map", StringComparison.Ordinal)) { primary = s; break; }
+                cur = SafePtr(reader, cur);
+            }
+        }
+        if (primary.Length > 0) primaryOk++;
+
+        string legacy = "";
+        var mapRow = SafePtr(reader, el + Poe2.AtlasNode.MapNodeId);
+        if (mapRow != 0)
+        {
+            var w = SafePtr(reader, mapRow);
+            var direct = w != 0 ? reader.ReadStringUtf16(w, 64) : "";
+            if (direct.StartsWith("Map", StringComparison.Ordinal)) legacy = direct;
+            else if (w != 0) { var idP = SafePtr(reader, w); legacy = idP != 0 ? reader.ReadStringUtf16(idP, 64) : ""; }
+        }
+        if (legacy.StartsWith("Map", StringComparison.Ordinal)) legacyOk++;
+
+        if (primary.Length == 0 && !legacy.StartsWith("Map", StringComparison.Ordinal))
+        {
+            neither++;
+            reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var fb);
+            if ((fb & 1) != 0) unlockedNeither++; else lockedNeither++;
+            if (neitherSample.Count < 6) neitherSample.Add(el);
+        }
+    }
+    Console.WriteLine($"[1] primary (nodeData rolled map) resolves: {primaryOk}/{nodes.Count}");
+    Console.WriteLine($"    legacy  (MapNodeId->WorldAreas row) resolves: {legacyOk}/{nodes.Count}");
+    Console.WriteLine($"    NEITHER resolves: {neither}/{nodes.Count}  (of those: {unlockedNeither} unlocked, {lockedNeither} locked)\n");
+
+    if (neitherSample.Count > 0)
+    {
+        Console.WriteLine("[2] raw dump for a sample of unresolved nodes (first hop from each path):");
+        foreach (var el in neitherSample)
+        {
+            var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+            var data = storage != 0 ? SafePtr(reader, storage + Poe2.AtlasNode.DataModel) : 0;
+            var hop0 = data != 0 ? data + Poe2.AtlasNode.DataMapId : 0;
+            var hop0Ptr = hop0 != 0 ? SafePtr(reader, hop0) : 0;
+            var hop0Str = hop0 != 0 ? reader.ReadStringUtf16(hop0, 32) : "";
+            var mapRow = SafePtr(reader, el + Poe2.AtlasNode.MapNodeId);
+            gridByEl(reader, el, out var gx, out var gy);
+            reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var fb);
+            Console.WriteLine($"    el=0x{el:X}  grid=({gx},{gy})  flags=0x{fb:X2}(unlocked={(fb & 1) != 0})  data=0x{data:X}  hop0@0x{hop0:X}=ptr:0x{hop0Ptr:X} str:\"{hop0Str.Replace("\0", "\\0")}\"  mapRow=0x{mapRow:X}");
+        }
+        Console.WriteLine("\n    if `data` itself is 0x0 for these, the nodeData sub-object isn't instantiated for them at all —");
+        Console.WriteLine("    i.e. the game hasn't populated per-node content until you approach/reveal it (true fog, not");
+        Console.WriteLine("    just a visual mask) and no memory offset can recover it before that happens.");
+    }
+    return 0;
+
+    static void gridByEl(MemoryReader r, nint el, out int gx, out int gy)
+    { r.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out gx); r.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out gy); }
+}
+
 // ── Atlas CURRENT-NODE discovery: find what marks the tile the player is standing in (the "player icon"
 //    tile). Hover that tile in-game, then run this — it identifies the hovered node and hunts for the
 //    distinguishing signal three ways: (A) a per-node FLAG that's unique to it, (B) an extra CHILD element
@@ -8225,8 +8487,24 @@ static (nint vt, nint canvas, List<nint> nodes) FindAtlasNodeClass(MemoryReader 
         { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
     }
     // Score by GRID POSITION uniqueness, not biome/icon-size (both drift to garbage post-patch —
-    // see Poe2Atlas.DetectNodeClass). Real class: every instance owns a distinct GridPos coord.
-    nint bestVt = 0; var bestDistinct = 0;
+    // see Poe2Atlas.DetectNodeClass). GridPos alone is necessary but NOT sufficient: a large decorative
+    // class can out-rank the true ~1000-node atlas class on raw coords.Count purely by volume (observed
+    // live 2026-09-15: a ~5312-instance class won over the real one). Cross-validate the top candidates
+    // against GRAPH CONNECTIVITY (AtlasGraph.ConnectionsVec, committed offset — cheap, no brute-force
+    // needed) before committing: a real atlas class is densely connected, decorative noise is not.
+    if (Environment.GetEnvironmentVariable("POE2R_ATLAS_DEBUG") == "1")
+        foreach (var (vt, list) in byVtable.Where(kv => kv.Value.Count >= 500).OrderByDescending(kv => kv.Value.Count))
+        {
+            int mnx = int.MaxValue, mxx = int.MinValue, mny = int.MaxValue, mxy = int.MinValue, ok = 0;
+            foreach (var el in list)
+            {
+                if (!reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx)) continue;
+                if (!reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy)) continue;
+                ok++; if (gx < mnx) mnx = gx; if (gx > mxx) mxx = gx; if (gy < mny) mny = gy; if (gy > mxy) mxy = gy;
+            }
+            Console.Error.WriteLine($"    [debug-raw] vt=0x{vt:X} count={list.Count} rawGridRead={ok} X[{mnx}..{mxx}] Y[{mny}..{mxy}]");
+        }
+    var ranked = new List<(nint vt, List<nint> list, HashSet<(int, int)> coords)>();
     foreach (var (vt, list) in byVtable)
     {
         if (list.Count < 50) continue;
@@ -8235,18 +8513,55 @@ static (nint vt, nint canvas, List<nint> nodes) FindAtlasNodeClass(MemoryReader 
         {
             if (!reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx)) continue;
             if (!reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy)) continue;
-            if (gx is < -64 or > 64 || gy is < 0 or > 192) continue;
+            if (gx is < -512 or > 512 || gy is < -512 or > 512) continue;
             inRange++; coords.Add((gx, gy));
         }
         if (inRange < list.Count * 0.5 || coords.Count < 20) continue;
-        if (coords.Count > bestDistinct) { bestDistinct = coords.Count; bestVt = vt; }
+        ranked.Add((vt, list, coords));
     }
+    if (ranked.Count == 0) return (0, 0, new List<nint>());
+    ranked.Sort((a, b) => b.coords.Count - a.coords.Count);
+    if (Environment.GetEnvironmentVariable("POE2R_ATLAS_DEBUG") == "1")
+        foreach (var (vt, list, coords) in ranked.Take(10))
+            Console.Error.WriteLine($"    [debug] candidate vt=0x{vt:X} count={list.Count} distinctCoords={coords.Count}");
+
+    nint bestVt = 0, bestCanvas = 0;
+    (nint vt, nint canvas, int connected)? bestFallback = null;
+    foreach (var (vt, list, coords) in ranked.Take(8))
+    {
+        var parentCount0 = new Dictionary<nint, int>();
+        foreach (var el in list) { var p = SafePtr(reader, el + Poe2.UiElement.Parent); if (p != 0) parentCount0[p] = parentCount0.GetValueOrDefault(p) + 1; }
+        if (parentCount0.Count == 0) continue;
+        var canvas0 = parentCount0.OrderByDescending(k => k.Value).First().Key;
+
+        var connected = new HashSet<(int, int)>();
+        var begin = SafePtr(reader, canvas0 + Poe2.AtlasGraph.ConnectionsVec);
+        if (begin != 0 && reader.TryReadStruct<nint>(canvas0 + Poe2.AtlasGraph.ConnectionsVec + 8, out var end) && end > begin)
+        {
+            var edgeCount = ((long)end - (long)begin) / Poe2.AtlasGraph.EdgeStride;
+            if (edgeCount is > 0 and <= 200_000)
+                for (long i = 0; i < edgeCount; i++)
+                {
+                    var e = begin + (nint)(i * Poe2.AtlasGraph.EdgeStride);
+                    if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff, out var sx)) continue;
+                    if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeSourceOff + 4, out var sy)) continue;
+                    if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff, out var dx)) continue;
+                    if (!reader.TryReadStruct<int>(e + Poe2.AtlasGraph.EdgeTargetOff + 4, out var dy)) continue;
+                    if (coords.Contains((sx, sy)) && coords.Contains((dx, dy))) { connected.Add((sx, sy)); connected.Add((dx, dy)); }
+                }
+        }
+        if (Environment.GetEnvironmentVariable("POE2R_ATLAS_DEBUG") == "1")
+            Console.Error.WriteLine($"    [debug] vt=0x{vt:X} canvas=0x{canvas0:X} coords={coords.Count} connected={connected.Count}");
+        if (bestFallback == null || connected.Count > bestFallback.Value.connected) bestFallback = (vt, canvas0, connected.Count);
+        if (connected.Count < coords.Count * 0.3) continue;
+        bestVt = vt; bestCanvas = canvas0; break;
+    }
+    // Nothing cleared the 30% bar — use the least-bad candidate ONLY if it showed ANY real graph
+    // connectivity (zero connected coords means "definitely not the atlas class").
+    if (bestVt == 0 && bestFallback is { connected: > 0 } fb) { bestVt = fb.vt; bestCanvas = fb.canvas; }
     if (bestVt == 0) return (0, 0, new List<nint>());
     var nodes = byVtable[bestVt];
-    var parentCount = new Dictionary<nint, int>();
-    foreach (var el in nodes) { var p = SafePtr(reader, el + Poe2.UiElement.Parent); if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1; }
-    var canvas = parentCount.Count == 0 ? 0 : parentCount.OrderByDescending(k => k.Value).First().Key;
-    return (bestVt, canvas, nodes);
+    return (bestVt, bestCanvas, nodes);
 }
 
 // Sniff name/path strings reachable from a UI element: scan its first 0xC0 bytes for canonical pointers,

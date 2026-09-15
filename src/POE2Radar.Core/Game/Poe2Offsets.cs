@@ -644,18 +644,28 @@ public static class Poe2
         public static readonly int DataStorage = OffsetOverrides.Get("AtlasNode.DataStorage", 0x10);   // *(node+0x10) → storage
         public static readonly int DataModel   = OffsetOverrides.Get("AtlasNode.DataModel", 0x20);   // *(storage+0x20) → nodeData
         public static readonly int DataBiome   = OffsetOverrides.Get("AtlasNode.DataBiome", 0x2CE);  // u8 within nodeData
-        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2BC);  // ⚠ 2026-09-05 was 0x2CF, which read a CONSTANT (every node Completed=true, hiding the atlas).
-                                               // 0x2BC fixed that as of the 2026-09-05 league patch, but re-verified live
-                                               // 2026-09-14: it now ALSO reads a constant (every sampled node = 4/"locked")
-                                               // on a lvl-91 character with clear atlas progress — a further drift, NOT
-                                               // yet re-discovered. Byte-scanning nearby offsets (Research --atlas-graph's
-                                               // fallback scan) found no clean small-enum replacement in +0x200..+0x310;
-                                               // the nodeData sub-struct likely differs by node KIND (map/boss/tower/
-                                               // citadel), so a flat offset scan across all of them is the wrong method —
-                                               // needs a scan restricted to one kind, or a fresh DevTree walk. Until then,
-                                               // treat Accessible/Completed as UNRELIABLE (accessible-frontier routing may
-                                               // come up empty). AtlasNode.Flags (+0x32F, bit0 unlocked/bit1 visited) is an
-                                               // untried, structurally simpler alternative worth checking first.
+        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2CF);  // ✓ live 2026-09-14 — u8: 0=locked, 1=accessible (not yet run), 255=completed.
+                                               // (bit0 accessible / bit1 completed still decodes all three values correctly:
+                                               // 0&1=0/0&2=0, 1&1=1/1&2=0, 255&1=1/255&2=1 — a completed map is also
+                                               // "accessible" since PoE2 lets you re-run it.) The 2026-09-05 league patch
+                                               // had moved this to 0x2BC, but as of 2026-09-14 it's back at 0x2CF (perhaps
+                                               // reverted by a follow-up patch) — re-verify per patch, don't assume either
+                                               // value is stable. Discovered by correlating candidate bytes against the
+                                               // separately-trusted AtlasNode.Flags Unlocked/Visited bits (Research
+                                               // --atlas-status) rather than guessing a value range: disjoint, fully
+                                               // explained 3-way split, 1095/1095 nodes, zero ambiguous reads.
+                                               // ⚠ That validation holds for ordinary biome maps only. Proven WRONG live
+                                               // 2026-09-15 for "arbiter"-tagged boss-encounter nodes (Matriarch/Patriarch
+                                               // Halls, etc.): an untouched farmable instance read Completed=true while the
+                                               // one-time quest variant the player HAD already beaten read Completed=false
+                                               // — wrong in BOTH directions, on the SAME field, at the SAME time. The
+                                               // elem-level Flags Unlocked/Visited bits were equally wrong for these nodes.
+                                               // This isn't a value-range miss; the nodeData sub-struct is almost certainly
+                                               // shaped differently for this node KIND and this offset lands on padding/an
+                                               // unrelated field, not status. Overlay code (RadarApp.UpdateAtlas) treats
+                                               // Accessible/Completed as untrustworthy for any node tagged "arbiter" in
+                                               // atlas_maps.json rather than gating visibility/routing on it. No known
+                                               // offset currently recovers true per-node completion for this content kind.
         public static readonly int DataMapId   = OffsetOverrides.Get("AtlasNode.DataMapId", 0x290);  // ✓ live 2026-09-05 — ptr chain → UTF-16 "MapXxx" (the ROLLED map). 2026-09-05 league patch: was 0x2A0.
     }
 

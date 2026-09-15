@@ -138,20 +138,39 @@ is rescaled by liveZoom/calibZoom each frame. See `resources/atlas-research-note
   `+0x00`, Slot `+0x08`. Item = Entity; Mods rarity `+0x94`/identified `+0x90`, affix vecs Implicit `+0xA0`/
   Explicit `+0xB8`/Enchant `+0xD0` (ModArrayStruct stride `0x40`, `+0x28` → Mods.dat row → first qword →
   UTF-16 internal mod id); Stack count `+0x18`; RenderItem art `+0x28`.
-- Atlas node (✓ live, Research `--atlas-graph`/`--atlas-probe`): GridPos `+0x310` (StdTuple2D<int>,
-  the node-graph key, ✓ 783/783 self-consistent live), DataMapId `+0x290` (ptr chain → UTF-16
-  "MapXxx", the rolled map, ✓ 766/783 live), canvas ConnectionsVec `+0x590` (✓ 1249 edges, 100%
-  endpoints on real grid positions), CurrentMarkerNodePtr `+0x2E8`. The node-class vtable is
-  detected by scoring GRID POSITION uniqueness (each real node owns a distinct (x,y)), NOT
-  biome/icon-size — both of those have drifted to garbage and will silently pick the wrong UI class
-  if trusted. Biome `+0x32E` and node Content `+0x310` (now aliases GridPos) are unresolved/
-  repurposed — do not read them.
-  **DataStatus `+0x2BC` (u8 within nodeData via DataStorage `+0x10`→DataModel `+0x20`: bit0
-  accessible, bit1 completed, bit2 locked) is UNRESOLVED as of 2026-09-14** — it reads a constant
-  (every node "locked") on a live character with clear atlas progress, so accessible/completed-frontier
-  routing may come up empty. Needs fresh discovery (the nodeData sub-struct likely differs by node
-  KIND — map/boss/tower/citadel — so a flat byte-offset scan across all node instances is the wrong
-  method); `AtlasNode.Flags +0x32F` (bit0 unlocked/bit1 visited) is an untried simpler alternative.
+- Atlas node (✓ live, Research `--atlas-graph`/`--atlas-probe`/`--atlas-status`/`--atlas-node-find`):
+  GridPos `+0x310` (StdTuple2D<int>, the node-graph key), DataMapId `+0x290` (ptr chain → UTF-16
+  "MapXxx", the rolled map), canvas ConnectionsVec `+0x590`, CurrentMarkerNodePtr `+0x2E8`. The
+  node-class vtable is detected by scoring GRID POSITION uniqueness (each real node owns a distinct
+  (x,y)), NOT biome/icon-size — both of those have drifted to garbage and will silently pick the
+  wrong UI class if trusted. Biome `+0x32E` and node Content `+0x310` (now aliases GridPos) are
+  unresolved/repurposed — do not read them.
+  **Node-class detection needs TWO checks, not one** (both bugs hit live 2026-09-15): (a) GridPos
+  uniqueness alone is insufficient — a large decorative UI class can out-rank the true ~1000-node
+  atlas class on raw distinct-coordinate COUNT purely by volume, so cross-validate the top
+  candidates against GRAPH CONNECTIVITY (read `canvas+AtlasGraph.ConnectionsVec` directly — cheap,
+  no brute-force needed once the offset is trusted — and require most of the candidate's own coords
+  to appear in a real edge; reject a candidate with near-zero connectivity even if it ranks #1 on
+  coords); (b) the GridPos sanity range must be generous (`±512` on both axes) — a `±64`/`0..192`
+  box that looked safe in one atlas region excluded a legitimate class sitting at `X up to 111`,
+  `Y down to -32`, in a different, further-explored region. Both bugs are exactly why atlas
+  detection could work in one spot and silently fail in another — "sometimes works" wasn't node
+  data flakiness, it was the detector's own box being too small for wherever the player currently is.
+  DataStatus `+0x2CF` (u8 within nodeData via DataStorage `+0x10`→DataModel `+0x20`: 0=locked,
+  1=accessible, 255=completed — bit0 accessible/bit1 completed still decodes all three correctly).
+  This field is volatile across patches independent of everything else in this list — it was
+  `+0x2CF` pre-2026-09-05, moved to `+0x2BC` that patch, then was back at `+0x2CF` by 2026-09-14 —
+  re-verify it separately every time. **Proven WRONG for "arbiter"-tagged boss-encounter nodes**
+  (Matriarch/Patriarch Halls, etc.) live 2026-09-15: an untouched farmable instance read
+  Completed=true while the one-time quest variant the player HAD already beaten read
+  Completed=false — wrong in both directions on the same field at the same time, and the elem-level
+  `Flags` Unlocked/Visited bits were equally wrong for these nodes. The nodeData sub-struct is almost
+  certainly shaped differently for this node KIND; this offset likely lands on padding for it, not
+  status. `RadarApp.UpdateAtlas` treats Accessible/Completed as untrustworthy for any node tagged
+  "arbiter" (checked via the offline `atlas_maps.json` tags, not this live field) rather than gating
+  visibility/routing on it — no known offset currently recovers true per-node completion for this
+  content kind. For ordinary biome maps the field is fine: this is the routing "accessible frontier"
+  source (RadarApp: `sources`) for auto-routing to a target map.
 - **Still TBD:** camera world→screen matrix (for world-space nameplates).
 
 ## Releasing

@@ -1850,6 +1850,7 @@ public sealed class RadarApp : IDisposable
         Console.WriteLine($"\n[atlas tile] \"{b.MapName}\"  code={b.MapCode}  kind={b.Kind}  grid={b.Grid}  biome={b.Biome}");
         // Status cross-validation (improvement 1): deeper-model accessible/completed vs the element flag bits.
         Console.WriteLine($"            accessible={b.Accessible} completed={b.Completed}  (elem flags=0x{b.Flags:X2}: unlocked={b.Unlocked} visited={b.Visited})");
+        Console.WriteLine($"            elem Id={b.Id}  State(+0x32C)={b.State}  Completion(+0x339)={b.Completion}  Content(+0x310)={b.Content}");
         Console.WriteLine($"             content: {content}");
         Console.WriteLine($"             web-UI filters -> Map: \"{b.MapName}\"" + (b.Tags.Count > 0 ? $"   Content: {content}" : ""));
 
@@ -2622,10 +2623,21 @@ public sealed class RadarApp : IDisposable
             var isNav = mNav != null;                     // Nav-to (route line)
             var isArrow = mArrow != null;                 // Arrow (off-screen pointer)
 
+            // Accessible/Completed come from a DEEP per-node model (Poe2Offsets.AtlasNode.DataStatus) that,
+            // as of 2026-09, reads a CONSTANT for "arbiter"-tagged boss-encounter nodes (Matriarch/Patriarch
+            // Halls, etc.) — proven live: an untouched farmable instance reads Completed=true while the
+            // one-time quest variant the player HAD already beaten read Completed=false. Both directions
+            // wrong, so the model plainly doesn't carry real per-node state for this content kind (probably
+            // a differently-shaped nodeData sub-struct where this offset is padding, not status). Don't let
+            // an untrustworthy read hide or de-prioritize content the player has never even seen.
+            var statusTrusted = !(n.MapDataTags?.Contains("arbiter", StringComparer.OrdinalIgnoreCase) ?? false);
+            var trustedCompleted = n.Completed && statusTrusted;
+            var trustedAccessible = n.Accessible && statusTrusted;
+
             // #3 declutter: hide done maps (and optionally accessible-now ones). F10 route endpoints are
             // drawn separately (BuildAtlasRoute), so they survive. Completed maps are already nav-excluded.
-            if (_settings.AtlasHideCompleted && n.Completed) continue;
-            if (_settings.AtlasHideAccessible && n.Accessible && !n.Completed) continue;
+            if (_settings.AtlasHideCompleted && trustedCompleted) continue;
+            if (_settings.AtlasHideAccessible && trustedAccessible && !trustedCompleted) continue;
 
             // #5 on-node content icons: resolve this node's content tags to icon asset basenames. Drawn on
             // tracked nodes and, crucially, on FOGGED nodes the game hides icons on (surfacing what's hidden).
@@ -2649,8 +2661,12 @@ public sealed class RadarApp : IDisposable
                 : null);   // icon-only fogged marks carry no label (icons alone)
             string? color = matched != null && _settings.AtlasHighlightColors.TryGetValue(matched, out var c) ? c
                 : (groupColor != null && !string.IsNullOrEmpty(n.MapName) && groupColor.TryGetValue(n.MapName, out var gc) ? gc : null);
-            // Route to NAV tiles that aren't already done — independent of the ring/arrow toggles.
-            if (isNav && !n.Completed) { trackedGrids.Add(n.Grid); gridColor[n.Grid] = color; }
+            // Route to NAV tiles that aren't already done — independent of the ring/arrow toggles. This used
+            // to hardcode the completed-exclusion regardless of AtlasHideCompleted OR content trust, which
+            // meant a wrong Completed read silently ate the route with no way to override it. Now it's never
+            // excluded for content we don't trust the status model for (trustedCompleted already accounts
+            // for that), and the global toggle remains an escape hatch for everything else.
+            if (isNav && (!trustedCompleted || !_settings.AtlasHideCompleted)) { trackedGrids.Add(n.Grid); gridColor[n.Grid] = color; }
             marks.Add(new AtlasMark(n.X, n.Y, isTracked, n.HasContent, n.Visited, n.Unlocked, n.Biome, n.IconType, label, color, isArrow, isNav, n.Element, contentIcons, n.Visible));
         }
 
@@ -2665,8 +2681,16 @@ public sealed class RadarApp : IDisposable
             // the mouse. We deliberately do NOT seed from the current-node marker: on some patches that
             // element tracks the HOVERED tile, which made every route re-origin from the cursor ("navs to
             // whatever I mouse over"). Fall back to the marker only when no accessible node is known (rare).
+            // A tile being routed TO must never also count as a valid route-FROM source — otherwise it
+            // trivially satisfies itself (0 hops) and the "already on the tile" check below swallows the
+            // route, regardless of whether its Accessible read is actually right for that content kind.
+            var trackedSet = new HashSet<(int, int)>(trackedGrids);
             var sources = new List<(int, int)>();
-            foreach (var n in nodes) if (n.Accessible) sources.Add(n.Grid);
+            foreach (var n in nodes)
+            {
+                var trusted = !(n.MapDataTags?.Contains("arbiter", StringComparer.OrdinalIgnoreCase) ?? false);
+                if (n.Accessible && trusted && !trackedSet.Contains(n.Grid)) sources.Add(n.Grid);
+            }
             if (sources.Count == 0 && curGrid is { } c0 && _atlas.GraphHas(c0)) sources.Add(c0);
             if (sources.Count > 0)
             {
