@@ -82,7 +82,17 @@ clearly gated — a personal QoL tool, not a headless bot.
   `/api/icons` — the icon library for the dashboard's SVG-preview shape pickers).
 - `Input/SendInputNative.cs` — scancode `SendInput` for auto-flask.
 
-**Research** (`src/POE2Radar.Research/Program.cs`) — probes: `--hp` (value-scan), `--vitals`
+**Research** (`src/POE2Radar.Research/Program.cs`) — **post-patch recovery starts here**:
+`--recover [--deep]` (relaxed AOB + structural GameState validation, then brute-forces
+InGameState→AreaInstance→LocalPlayer and prints the block shift), `--verify-fields` (re-locates the
+fields that DON'T move with that block — AreaInfo, area level/hash, entity maps, terrain, UiRoot,
+Camera — each by shape, marking which committed offsets still match), and `--map-watch` (toggle-diff
+to re-pin the UiElement visibility bit). Run those three in order after a patch before anything else.
+⚠ These hunts must NOT require 8-byte-aligned pointers: PoE2 stores raw pointers into string blobs
+and mid-buffer (WorldAreas row strings, terrain StdVector end pointers), so an alignment filter
+silently hides the very fields you are looking for.
+
+Other probes: `--hp` (value-scan), `--vitals`
 (dump the local player's Life component — what the configured Health/Mana/ES offsets read + every
 valid VitalStruct in the component; the per-patch re-validation for the auto-flask pools), `--chain`,
 `--entity`, `--find`/`--find-entities`/`--find-terrain`/`--find-map`, `--tiles`, `--rarity`,
