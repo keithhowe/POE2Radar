@@ -184,6 +184,7 @@ DocProject/Help/html
 
 # Click-Once directory
 publish/
+publish-*/
 
 # Publish Web Output
 *.[Pp]ublish.xml
@@ -418,6 +419,7 @@ resources/_reference/
 
 # release build output
 publish/
+publish-*/
 POE2Radar-*-win-x64.zip
 
 

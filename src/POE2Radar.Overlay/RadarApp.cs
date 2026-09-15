@@ -2583,6 +2583,7 @@ public sealed class RadarApp : IDisposable
         sig = sig * 1000003L ^ (curGrid?.GetHashCode() ?? 0);                       // re-solve routes as the player moves
         sig = sig * 1000003L ^ (_settings.AtlasAutoRoute ? 1L : 0L) ^ ((long)_settings.AtlasAutoRouteMaxHops << 1);
         sig = sig * 1000003L ^ (long)(_settings.AtlasNavTags?.Count ?? 0);          // re-solve when the nav set changes
+        sig = sig * 1000003L ^ ((long)_atlas.GraphNodeCount << 8);                  // re-solve when the edge vector grows (atlas streams in)
         // Rebuild when the #3 hide filters, #5 icon toggle, or #7 group set change.
         sig = sig * 1000003L ^ (_settings.AtlasHideCompleted ? 2L : 0L) ^ (_settings.AtlasHideAccessible ? 4L : 0L)
             ^ (_settings.AtlasShowContentIcons ? 8L : 0L) ^ ((long)(_settings.AtlasGroups?.Count ?? 0) << 4);

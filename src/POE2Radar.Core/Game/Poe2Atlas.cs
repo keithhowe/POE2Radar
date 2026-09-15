@@ -308,6 +308,7 @@ public sealed class Poe2Atlas
     // cached (rebuilt on Invalidate / canvas change). This is what enables node-to-node routing.
     private readonly Dictionary<(int, int), List<(int, int)>> _graph = new();
     private nint _graphCanvas;   // canvas the cached _graph was built from (0 = not built)
+    private nint _graphBegin, _graphEnd;   // edge-vector bounds the cached _graph was built from (it grows as the atlas streams in)
     // The current-location ("player icon") marker: the lone non-node element whose +0x300 → a node. Located
     // during DetectNodeClass (vtable-independent — see Poe2.AtlasGraph.CurrentMarkerNodePtr). *(marker+0x300)
     // is the node the player is currently in (the route's true start).
@@ -449,7 +450,7 @@ public sealed class Poe2Atlas
     /// defaults only when the full map/content set is available.</summary>
     public bool AllTagsResolved { get; private set; }
 
-    private void Invalidate() { _nodeCanvas = 0; _nodeVtable = 0; _hiddenTicks = 0; _tagCache.Clear(); _graph.Clear(); _graphCanvas = 0; _currentMarker = 0; }
+    private void Invalidate() { _nodeCanvas = 0; _nodeVtable = 0; _hiddenTicks = 0; _tagCache.Clear(); _graph.Clear(); _graphCanvas = 0; _graphBegin = 0; _graphEnd = 0; _currentMarker = 0; }
 
     /// <summary>The player's CURRENT atlas node grid coord (the "player icon" tile), via the marker element
     /// (<see cref="Poe2Offsets.AtlasGraph.CurrentMarkerNodePtr"/>): <c>*(marker+0x300)</c> → current node →
@@ -477,10 +478,16 @@ public sealed class Poe2Atlas
     /// holds <see cref="_nodeLock"/>.</summary>
     private void EnsureGraph()
     {
-        if (_nodeCanvas == 0 || _graphCanvas == _nodeCanvas) return;
-        _graph.Clear(); _graphCanvas = _nodeCanvas;
+        if (_nodeCanvas == 0) return;
+        // The edge vector is NOT static for the life of the canvas: the game fills it in as more of the
+        // atlas streams in (observed live 2026-09-14: 467 graph nodes cached at first open vs 1931 nodes /
+        // 3138 edges on the same canvas minutes later, so F10 routes reported "start not in graph").
+        // Keying the cache on the canvas alone froze that first partial read. Re-read the vector's
+        // begin/end each call (2 cheap reads) and rebuild whenever they move.
         var begin = Ptr(_nodeCanvas + Poe2.AtlasGraph.ConnectionsVec);
         if (begin == 0 || !_reader.TryReadStruct<nint>(_nodeCanvas + Poe2.AtlasGraph.ConnectionsVec + 8, out var end)) return;
+        if (_graphCanvas == _nodeCanvas && _graphBegin == begin && _graphEnd == end) return;
+        _graph.Clear(); _graphCanvas = _nodeCanvas; _graphBegin = begin; _graphEnd = end;
         var bytes = (long)end - (long)begin;
         if (bytes <= 0 || bytes % Poe2.AtlasGraph.EdgeStride != 0) return;
         var count = (int)(bytes / Poe2.AtlasGraph.EdgeStride);
