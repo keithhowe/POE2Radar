@@ -123,8 +123,14 @@ internal static class Recovery
 
                         var meta = ReadStdWString(reader, details + Poe2.EntityDetails.Name);
                         if (!meta.StartsWith("Metadata/Characters/", StringComparison.Ordinal)) continue;
+                        // Skip cosmetic child entities (hair/outfit .ao attachments) — they live under
+                        // Metadata/Characters/ too and gave false "LocalPlayer" hits (2026-11 patch hunt).
+                        if (meta.Contains("/attachments/", StringComparison.OrdinalIgnoreCase)
+                            || meta.EndsWith(".ao", StringComparison.OrdinalIgnoreCase)) continue;
+                        // The real player has a positive entity id at Entity.Id (not 0).
+                        if (!reader.TryReadStruct<uint>(lp + Poe2.Entity.Id, out var eid) || eid == 0) continue;
 
-                        Console.WriteLine($"  HIT  slot 0x{r.Slot:X16}  via {src}");
+                        Console.WriteLine($"  HIT  slot 0x{r.Slot:X16}  via {src}  entityId {eid}");
                         Console.WriteLine($"      InGameState.AreaInstanceData = 0x{aiOff:X3}   (committed 0x{Poe2.InGameState.AreaInstanceData:X3})");
                         Console.WriteLine($"      AreaInstance.LocalPlayer     = 0x{lpOff:X3}   (committed 0x{Poe2.AreaInstance.LocalPlayer:X3})");
                         Console.WriteLine($"      InGameState 0x{igs:X16}  AreaInstance 0x{ai:X16}  LocalPlayer 0x{lp:X16}");
