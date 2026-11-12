@@ -13,7 +13,7 @@ namespace POE2Radar.Overlay;
 /// </summary>
 internal static class UpdateChecker
 {
-    private const string Repo = "Sikaka/POE2Radar";
+    private const string Repo = "keithhowe/POE2Radar";   // the maintained repository (the original Sikaka/POE2Radar is no longer maintained)
     public static readonly string ReleasesPage = $"https://github.com/{Repo}/releases";
 
     /// <summary>This build's version ("0.7.0"), from the assembly version baked in by the csproj.</summary>

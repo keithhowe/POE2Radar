@@ -48,7 +48,7 @@ quality-of-life feature.
 ## Download (no build required)
 
 Grab the latest **`POE2Radar-vX.Y.Z-win-x64.zip`** from the
-[Releases page](https://github.com/Sikaka/POE2Radar/releases), unzip, and run `POE2Radar.Overlay.exe`
+[Releases page](https://github.com/keithhowe/POE2Radar/releases), unzip, and run `POE2Radar.Overlay.exe`
 **as Administrator** (reading another process's memory requires it) with PoE2 already running.
 The build is self-contained — no .NET install needed.
 
