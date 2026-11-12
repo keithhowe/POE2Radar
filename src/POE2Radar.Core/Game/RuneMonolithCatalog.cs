@@ -43,20 +43,24 @@ public sealed class RuneMonolithCatalog
     /// rare reward-less "description" recipes (e.g. dungeon keys) — those carry <paramref name="Description"/>.</summary>
     public readonly record struct Offer(string Name, int Count, int Size, string Runes, string Description);
 
-    /// <summary>The recipes a monolith offers. <paramref name="anchorIdx"/> &lt; 0 (and
-    /// <paramref name="isUnique"/> true) selects the anchor-less "all size&lt;=N" branch.
+    /// <summary>The recipes a monolith offers. <paramref name="isUnique"/> selects the anchor-less
+    /// "all size&lt;=N" branch. An ANCHORED monolith whose anchor could not be decoded
+    /// (<paramref name="anchorIdx"/> &lt; 0, or <paramref name="anchorPos"/> outside 0..N-1) offers
+    /// NOTHING — unknown is not the same as anchor-less, and falling into the "everything" branch would
+    /// price the monolith at the best recipe in the whole catalog.
     /// <paramref name="areaLevel"/> &lt;= 0 disables level gating (offers every tier).</summary>
     public List<Offer> Offers(int anchorIdx, int anchorPos, int holeCount, bool isUnique, int areaLevel)
     {
         var result = new List<Offer>();
         if (holeCount <= 0) return result;
+        if (!isUnique && (anchorIdx < 0 || anchorPos < 0 || anchorPos >= holeCount)) return result;
 
         foreach (var rec in _recipes)
         {
             if (rec.size > holeCount) continue;
             if (areaLevel > 0 && rec.maxLevel > 0 && (areaLevel < rec.minLevel || areaLevel > rec.maxLevel)) continue;
 
-            if (isUnique || anchorIdx < 0)
+            if (isUnique)
             {
                 // Anchor-less monolith: the game's offer builder bypasses the anchor + partial gates.
                 result.Add(ToOffer(rec));

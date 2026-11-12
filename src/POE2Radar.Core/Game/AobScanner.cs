@@ -331,7 +331,4 @@ public sealed record AobDiscoveryHit(
         sb.Append(" }");
         return sb.ToString();
     }
-
-    /// <summary>Offset within PoE.exe's image (relative to module base).</summary>
-    public long TextRva => (long)(SectionBase - SectionBase) + MatchOffset; // filled via SectionBase + MatchOffset
 }

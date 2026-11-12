@@ -55,11 +55,14 @@ public sealed class OverlayWindow : IDisposable
     private nint _memDC;
     private nint _dibSection;
     private nint _dibSectionPrev; // previously-selected object in memDC
+    private nint _dibBits;        // the DIB section's pixel memory (Width*Height BGRA, top-down)
 
     public int Width { get; private set; }
     public int Height { get; private set; }
     public int OriginX { get; private set; }
     public int OriginY { get; private set; }
+    /// <summary>True when there is a window AND a live render target. False after device loss until
+    /// <see cref="TryRecreateRenderTarget"/> succeeds (the renderer retries it).</summary>
     public bool IsValid => _hwnd != 0 && _renderTarget != null;
 
     /// <summary>The overlay's window handle (for client-coord conversion of the cursor, etc.).</summary>
@@ -179,14 +182,53 @@ public sealed class OverlayWindow : IDisposable
         _d2dFactory    = D2D1.D2D1CreateFactory<ID2D1Factory>(Vortice.Direct2D1.FactoryType.SingleThreaded);
         _dwriteFactory = DWrite.DWriteCreateFactory<IDWriteFactory>(Vortice.DirectWrite.FactoryType.Shared);
 
-        // ID2D1DCRenderTarget renders into whatever DC we BindDC to each frame.
+        CreateRenderTarget();
+
+        AllocateBackingBitmap(800, 600);
+    }
+
+    /// <summary>Create the DC render target (not yet bound to a DC). 96 DPI ⇒ 1 DIP == 1 device pixel, so
+    /// renderer coordinates are pixels of the DIB — the same space as the game's client rect as THIS
+    /// process sees it. The process is deliberately NOT DPI-aware: on a scaled monitor Windows hands us
+    /// virtualized (smaller) rects and stretches the overlay, which costs sharpness but keeps the
+    /// per-frame clear + UpdateLayeredWindow blit small. Measured on 3840x2160 @ 150%: per-monitor
+    /// awareness (full-resolution DIB) took ~14 ms/frame (72 fps) vs ~5-8 ms (135-142 fps) without it.
+    /// Every projection is proportional to Width/Height, so alignment holds either way.</summary>
+    private void CreateRenderTarget()
+    {
+        // ID2D1DCRenderTarget renders into whatever DC we BindDC to.
         var rtProps = new RenderTargetProperties(
             RenderTargetType.Default,
             new PixelFormat(Vortice.DXGI.Format.B8G8R8A8_UNorm, AlphaMode.Premultiplied),
             96, 96, RenderTargetUsage.None, FeatureLevel.Default);
-        _renderTarget = _d2dFactory.CreateDCRenderTarget(rtProps);
+        _renderTarget = _d2dFactory!.CreateDCRenderTarget(rtProps);
+    }
 
-        AllocateBackingBitmap(800, 600);
+    /// <summary>
+    /// Device-loss recovery: throw away the render target and build a fresh one bound to the current
+    /// backing DC. Call after <c>EndDraw</c> reports a failure (D2DERR_RECREATE_TARGET — GPU driver reset,
+    /// adapter change, remote-desktop switch…). Every device-dependent resource created from the OLD
+    /// target (brushes, bitmaps) is dead and must be released by its owner BEFORE calling this. Returns
+    /// false — leaving <see cref="IsValid"/> false — when the device is still unavailable; call again later.
+    /// </summary>
+    public bool TryRecreateRenderTarget()
+    {
+        if (_hwnd == 0 || _d2dFactory is null) return false;
+        _renderTarget?.Dispose();
+        _renderTarget = null;
+        try
+        {
+            CreateRenderTarget();
+            if (_memDC != 0)
+                _renderTarget!.BindDC(_memDC, new Vortice.RawRect(0, 0, Width, Height));
+            return true;
+        }
+        catch (SharpGen.Runtime.SharpGenException)
+        {
+            _renderTarget?.Dispose();
+            _renderTarget = null;
+            return false;
+        }
     }
 
     /// <summary>
@@ -214,12 +256,20 @@ public sealed class OverlayWindow : IDisposable
                     biCompression = OverlayNative.BI_RGB,
                 },
             };
-            _dibSection = OverlayNative.CreateDIBSection(_memDC, ref bmi, OverlayNative.DIB_RGB_COLORS, out _, 0, 0);
+            _dibSection = OverlayNative.CreateDIBSection(_memDC, ref bmi, OverlayNative.DIB_RGB_COLORS, out _dibBits, 0, 0);
             if (_dibSection == 0) throw new InvalidOperationException("CreateDIBSection failed");
 
             _dibSectionPrev = OverlayNative.SelectObject(_memDC, _dibSection);
 
-            _renderTarget!.BindDC(_memDC, new Vortice.RawRect(0, 0, width, height));
+            // No render target right now (device lost, not yet recreated): TryRecreateRenderTarget binds
+            // the new one to this DC. A bind that fails means the device went away under us — drop the
+            // target so the renderer goes through the same recovery path instead of crashing on a resize.
+            try { _renderTarget?.BindDC(_memDC, new Vortice.RawRect(0, 0, width, height)); }
+            catch (SharpGen.Runtime.SharpGenException)
+            {
+                _renderTarget?.Dispose();
+                _renderTarget = null;
+            }
         }
         finally
         {
@@ -238,6 +288,7 @@ public sealed class OverlayWindow : IDisposable
             _dibSectionPrev = 0;
         }
         if (_dibSection != 0) { OverlayNative.DeleteObject(_dibSection); _dibSection = 0; }
+        _dibBits = 0; // owned by the DIB section just deleted
         if (_memDC != 0)      { OverlayNative.DeleteDC(_memDC);          _memDC = 0; }
     }
 
@@ -275,21 +326,48 @@ public sealed class OverlayWindow : IDisposable
         }
     }
 
-    /// <summary>Track the PoE window's screen rect; resize backing bitmap if dimensions changed.</summary>
+    /// <summary>
+    /// Blank the overlay: zero the backing DIB (fully transparent) and push it. Used when a frame could
+    /// not be drawn (device lost) so the last good frame isn't left frozen on screen over the game.
+    /// Touches only GDI memory — works with no render target.
+    /// </summary>
+    public unsafe void PresentCleared()
+    {
+        if (_hwnd == 0 || _memDC == 0 || _dibBits == 0 || Width <= 0 || Height <= 0) return;
+        OverlayNative.GdiFlush();
+        new Span<byte>((void*)_dibBits, checked(Width * Height * 4)).Clear();
+        Present();
+    }
+
+    /// <summary>
+    /// Track the PoE window's CLIENT area (the game's actual viewport) in screen coordinates; resize the
+    /// backing bitmap if its dimensions changed. The client rect — not the window rect — is what every
+    /// projection treats as the viewport (map centre/scale, world→screen, UI element rects), and the two
+    /// only coincide in borderless mode: in a captioned window the window rect also covers the title bar
+    /// and the resize borders, which would shift and stretch everything. Returns false, keeping the
+    /// previous size and position, when the game window is minimized or has no client area — the overlay
+    /// is never reallocated to a minimized window's stub rect. (Same coordinate space as the DIB and the
+    /// cursor reads — see <see cref="CreateRenderTarget"/> for why the process is not DPI-aware.)
+    /// </summary>
     public bool TrackGameWindow(nint gameHwnd)
     {
         if (gameHwnd == 0) return false;
-        if (!OverlayNative.GetWindowRect(gameHwnd, out var rect)) return false;
+        if (OverlayNative.IsIconic(gameHwnd)) return false;
+        if (!OverlayNative.GetClientRect(gameHwnd, out var rect)) return false;
 
         var w = rect.Right  - rect.Left;
         var h = rect.Bottom - rect.Top;
         if (w <= 0 || h <= 0) return false;
 
-        if (rect.Left != OriginX || rect.Top != OriginY || w != Width || h != Height)
+        // Client-area top-left in screen coordinates.
+        var origin = new OverlayNative.POINT { X = 0, Y = 0 };
+        if (!OverlayNative.ClientToScreen(gameHwnd, ref origin)) return false;
+
+        if (origin.X != OriginX || origin.Y != OriginY || w != Width || h != Height)
         {
             if (w != Width || h != Height) AllocateBackingBitmap(w, h);
-            OriginX = rect.Left;
-            OriginY = rect.Top;
+            OriginX = origin.X;
+            OriginY = origin.Y;
             // Position is communicated to the OS via UpdateLayeredWindow's pptDst.
         }
 

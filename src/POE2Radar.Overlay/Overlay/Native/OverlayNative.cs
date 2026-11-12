@@ -111,6 +111,22 @@ internal static partial class OverlayNative
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool GetWindowRect(nint hwnd, out RECT lpRect);
 
+    /// <summary>The window's CLIENT area in client coordinates (so Left/Top are always 0 and Right/Bottom
+    /// are its width/height). All zeros for a minimized window.</summary>
+    [LibraryImport("user32.dll", EntryPoint = "GetClientRect")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool GetClientRect(nint hwnd, out RECT lpRect);
+
+    /// <summary>Convert a point in the window's client coordinates to screen coordinates (in/out via ref).</summary>
+    [LibraryImport("user32.dll", EntryPoint = "ClientToScreen")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool ClientToScreen(nint hwnd, ref POINT lpPoint);
+
+    /// <summary>True iff the window is minimized.</summary>
+    [LibraryImport("user32.dll", EntryPoint = "IsIconic")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsIconic(nint hwnd);
+
     [LibraryImport("user32.dll", EntryPoint = "MoveWindow")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool MoveWindow(nint hwnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);

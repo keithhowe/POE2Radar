@@ -164,9 +164,7 @@ public sealed class WatchedEntities
     {
         try
         {
-            var dir = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(_filePath, JsonSerializer.Serialize(_entries.Values.ToList(), Json));
+            Config.AtomicFile.WriteAllText(_filePath, JsonSerializer.Serialize(_entries.Values.ToList(), Json));
         }
         catch (Exception ex) { Console.Error.WriteLine($"Watched entities save failed: {ex.Message}"); }
     }

@@ -11,7 +11,14 @@ namespace POE2Radar.Overlay.Web;
 /// Tiny read-only HTTP API for live troubleshooting (the PoE2 stand-in for POEMCP). Serves the
 /// latest <see cref="RadarState"/> published by <see cref="RadarApp"/> each world tick.
 ///
-/// Endpoints (localhost:7777, read-only — no CORS header, so only the same-origin dashboard can read them):
+/// Reads emit no CORS header, so only the same-origin dashboard can read them. Every WRITE (POST) goes
+/// through <see cref="AllowWrite"/>, which rejects cross-origin requests: the Host header must be a
+/// loopback name, an Origin header (browsers always send one on a cross-origin POST) must be a loopback
+/// origin on this server's port, and the body must be <c>Content-Type: application/json</c> — a
+/// non-"simple" type, so a foreign page's request needs a CORS preflight that we never approve. Bodies
+/// are capped at <see cref="MaxBodyBytes"/> (413).
+///
+/// Endpoints (localhost:7777):
 ///   GET /                         — the web dashboard (see <see cref="DashboardHtml"/>)
 ///   GET /health                   — liveness probe
 ///   GET /state                    — player, area, map visibility, entity counts by category
@@ -21,19 +28,23 @@ namespace POE2Radar.Overlay.Web;
 ///       &amp;radius=80                — only within N grid units of the player
 ///       &amp;limit=50                 — cap results (default 500)
 ///   GET  /api/icons               — the icon library (name + viewBox + paths) for the dashboard pickers
-///   GET  /api/settings            — current radar/visual settings (+ read-only flask mirror)
-///   POST /api/settings            — write whitelisted radar/visual settings only (flags + calibration);
-///                                   loopback-Host-gated; never exposes flask/automation writes
+///   GET  /api/settings            — current settings (radar/visual + auto-flask tuning)
+///   POST /api/settings            — write whitelisted settings: radar/visual flags, calibration, and the
+///                                   auto-flask thresholds/cooldowns/keys. The auto-flask MASTER ENABLE is
+///                                   never writable here (local F8 key only). Same-origin-gated.
 ///   GET  /api/nav                 — current navigation-target selection (ids + color slots)
 ///   POST /api/nav                 — toggle/clear a navigation target (draw-only; never sends input to
-///                                   the game); loopback-Host-gated like POST /api/settings
+///                                   the game); same-origin-gated like POST /api/settings
 ///   GET  /api/hidden              — user cull patterns (entities matching these are hidden everywhere)
-///   POST /api/hidden              — add/remove/clear a cull pattern ({add|remove|clear}); loopback-Host-gated
-///   GET  /api/watched             — user highlight rules (pattern/label/color/shape/size/enabled)
-///   POST /api/watched             — add/update/remove a highlight rule; loopback-Host-gated
+///   POST /api/hidden              — add/remove/clear a cull pattern ({add|remove|clear}); same-origin-gated
+///   GET  /api/display-rules       — the ordered display ruleset
+///   POST /api/display-rules       — replace the whole ruleset ({rules:[…]} | {clear:true}); same-origin-gated
+///   GET  /api/landmarks           — curated landmark labels (baked + user overlay); ?export=1 = merged JSON
+///   POST /api/landmarks           — {set|remove|import} on the user overlay; same-origin-gated
 ///   GET  /api/zone                — static zone reference: friendly name, act/level, flags, leveling notes
-///   GET  /api/landmark-patterns   — user tile-path patterns surfaced as landmarks (pattern/label/enabled)
-///   POST /api/landmark-patterns   — add/update/remove a landmark pattern; loopback-Host-gated
+///   GET  /api/tiles, /api/mods    — rule-picker vocabularies (area tile paths / known monster mod ids)
+///   GET  /api/prices, /api/version, /api/atlas — pricing status, update check, atlas inspection data
+///   POST /api/atlas-select, /api/atlas-route, /api/atlas-highlight — draw-only atlas state; same-origin-gated
 /// </summary>
 public sealed class ApiServer : IDisposable
 {
@@ -65,8 +76,37 @@ public sealed class ApiServer : IDisposable
     // Version/update info provider ({current, latest, updateAvailable, url}) for the dashboard banner.
     private readonly Func<object>? _version;
     private volatile bool _running;
+    private readonly int _port;   // the port we listen on — a write's Origin header must name it
+
+    /// <summary>Largest request body a write endpoint accepts (bytes). Anything bigger is refused with 413.</summary>
+    private const int MaxBodyBytes = 2 * 1024 * 1024;
 
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+    // Same as Json, but an int-typed property tolerates a fractional number (rounded) instead of failing the
+    // whole object — the dashboard's number inputs can produce "2.5" for an integer field. Used only to READ
+    // posted sub-objects (settings cards / display rules).
+    private static readonly JsonSerializerOptions JsonLenient = new(Json) { Converters = { new LenientIntConverter() } };
+
+    private sealed class LenientIntConverter : System.Text.Json.Serialization.JsonConverter<int>
+    {
+        public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Number)
+            {
+                if (reader.TryGetInt32(out var i)) return i;
+                if (reader.TryGetDouble(out var d) && double.IsFinite(d))
+                    return (int)Math.Clamp(Math.Round(d), int.MinValue, int.MaxValue);
+            }
+            throw new JsonException("expected an integer");
+        }
+
+        public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options)
+            => writer.WriteNumberValue(value);
+    }
+
+    /// <summary>Thrown by <see cref="ReadBody"/> when a request body exceeds <see cref="MaxBodyBytes"/>.</summary>
+    private sealed class RequestTooLargeException : Exception { }
 
     public ApiServer(
         Func<RadarState> state,
@@ -103,6 +143,7 @@ public sealed class ApiServer : IDisposable
         _tiles = tilesProvider;
         _knownMods = knownModsProvider;
         _prices = pricesProvider;
+        _port = port;
         _listener.Prefixes.Add($"http://localhost:{port}/");
     }
 
@@ -122,6 +163,8 @@ public sealed class ApiServer : IDisposable
             try { ctx = _listener.GetContext(); }
             catch { return; } // listener stopped
             try { Handle(ctx); }
+            catch (RequestTooLargeException) { TryWrite(ctx, 413, JsonSerializer.Serialize(new { error = "request body too large" }, Json)); }
+            catch (JsonException ex) { TryWrite(ctx, 400, JsonSerializer.Serialize(new { error = "malformed JSON: " + ex.Message }, Json)); }
             catch (Exception ex) { TryWrite(ctx, 500, JsonSerializer.Serialize(new { error = ex.Message }, Json)); }
         }
     }
@@ -244,15 +287,10 @@ public sealed class ApiServer : IDisposable
                 }
                 else if (ctx.Request.HttpMethod == "POST")
                 {
-                    // CSRF / DNS-rebinding guard: only honor writes whose Host header is the loopback
-                    // name we bind to. A page on another origin that rebinds DNS to 127.0.0.1 still
-                    // sends its own hostname in Host, so this rejects drive-by writes. (Reads are
-                    // already unreadable cross-origin since we emit no Access-Control-Allow-Origin.)
-                    if (!IsLoopbackHost(ctx.Request))
-                    {
-                        Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
-                        break;
-                    }
+                    // CSRF / DNS-rebinding guard (see AllowWrite): loopback Host + loopback Origin +
+                    // application/json body. (Reads are already unreadable cross-origin since we emit
+                    // no Access-Control-Allow-Origin.)
+                    if (!AllowWrite(ctx)) break;
                     var applied = ApplySettings(ReadBody(ctx));
                     Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, applied, settings = ReadSettings() }, Json));
                 }
@@ -271,14 +309,10 @@ public sealed class ApiServer : IDisposable
                 }
                 else if (ctx.Request.HttpMethod == "POST")
                 {
-                    // Same CSRF / DNS-rebinding guard as POST /api/settings: only honor writes whose
-                    // Host header is our loopback name. (This is draw-only selection — it never sends
-                    // input to the game — but we still gate it so a cross-origin page can't drive it.)
-                    if (!IsLoopbackHost(ctx.Request))
-                    {
-                        Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
-                        break;
-                    }
+                    // Same CSRF / DNS-rebinding guard as POST /api/settings. (This is draw-only selection
+                    // — it never sends input to the game — but we still gate it so a cross-origin page
+                    // can't drive it.)
+                    if (!AllowWrite(ctx)) break;
                     ApplyNav(ReadBody(ctx));
                     Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, selected = NavSelection() }, Json));
                 }
@@ -297,12 +331,8 @@ public sealed class ApiServer : IDisposable
                 }
                 else if (ctx.Request.HttpMethod == "POST")
                 {
-                    // Same CSRF / DNS-rebinding guard as the other writes: loopback Host only.
-                    if (!IsLoopbackHost(ctx.Request))
-                    {
-                        Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
-                        break;
-                    }
+                    // Same CSRF / DNS-rebinding guard as the other writes.
+                    if (!AllowWrite(ctx)) break;
                     ApplyHidden(ReadBody(ctx));
                     Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, patterns = _hidden.All }, Json));
                 }
@@ -364,9 +394,9 @@ public sealed class ApiServer : IDisposable
 
             case "/api/atlas-select":
             {
-                // Set which atlas nodes (by element address) to highlight in-game. Draw-only; loopback-gated.
+                // Set which atlas nodes (by element address) to highlight in-game. Draw-only; same-origin-gated.
                 if (ctx.Request.HttpMethod != "POST") { Write(ctx, 405, JsonSerializer.Serialize(new { error = "method not allowed" }, Json)); break; }
-                if (!IsLoopbackHost(ctx.Request)) { Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json)); break; }
+                if (!AllowWrite(ctx)) break;
                 var els = new List<long>();
                 try
                 {
@@ -385,9 +415,9 @@ public sealed class ApiServer : IDisposable
             case "/api/atlas-route":
             {
                 // Set the atlas route destination by grid coord: {"grid":"x,y"}; {"clear":true} removes it.
-                // Draw-only (the overlay draws a line on the atlas screen); loopback-gated.
+                // Draw-only (the overlay draws a line on the atlas screen); same-origin-gated.
                 if (ctx.Request.HttpMethod != "POST") { Write(ctx, 405, JsonSerializer.Serialize(new { error = "method not allowed" }, Json)); break; }
-                if (!IsLoopbackHost(ctx.Request)) { Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json)); break; }
+                if (!AllowWrite(ctx)) break;
                 (int X, int Y)? grid = null; var clear = false;
                 try
                 {
@@ -410,7 +440,7 @@ public sealed class ApiServer : IDisposable
             {
                 // Set the active atlas highlight rules (content tags). Only matching nodes draw in-game.
                 if (ctx.Request.HttpMethod != "POST") { Write(ctx, 405, JsonSerializer.Serialize(new { error = "method not allowed" }, Json)); break; }
-                if (!IsLoopbackHost(ctx.Request)) { Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json)); break; }
+                if (!AllowWrite(ctx)) break;
                 var rules = new List<(string tag, string color, bool track, bool nav, bool arrow)>();
                 try
                 {
@@ -448,11 +478,7 @@ public sealed class ApiServer : IDisposable
                 }
                 else if (ctx.Request.HttpMethod == "POST")
                 {
-                    if (!IsLoopbackHost(ctx.Request))
-                    {
-                        Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
-                        break;
-                    }
+                    if (!AllowWrite(ctx)) break;
                     ApplyLandmarks(ReadBody(ctx));
                     Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, entries = _landmarkStore.All() }, Json));
                 }
@@ -471,11 +497,7 @@ public sealed class ApiServer : IDisposable
                 }
                 else if (ctx.Request.HttpMethod == "POST")
                 {
-                    if (!IsLoopbackHost(ctx.Request))
-                    {
-                        Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
-                        break;
-                    }
+                    if (!AllowWrite(ctx)) break;
                     ApplyDisplayRules(ReadBody(ctx));
                     Write(ctx, 200, JsonSerializer.Serialize(new { ok = true, rules = _displayRules.All }, Json));
                 }
@@ -508,6 +530,7 @@ public sealed class ApiServer : IDisposable
         showMonsters = _settings.ShowMonsters,
         showTerrain = _settings.ShowTerrain,
         showPlayerBlip = _settings.ShowPlayerBlip,
+        hideInHideout = _settings.HideInHideout,
         labelDeclusterPx = _settings.LabelDeclusterPx,
         fpsCap = _settings.FpsCap,
         hpBarNormal = _settings.HpBarNormal,
@@ -564,13 +587,17 @@ public sealed class ApiServer : IDisposable
                 case "useCuratedLandmarks" when TryBool(p.Value, out var b): _settings.UseCuratedLandmarks = b; applied.Add(p.Name); break;
                 case "landmarkClusterGap" when TryInt(p.Value, out var n): _settings.LandmarkClusterGap = Math.Clamp(n, 0, 64); applied.Add(p.Name); break;
                 case "labelDeclusterPx" when TryFloat(p.Value, out var f): _settings.LabelDeclusterPx = Math.Clamp(f, 0f, 300f); applied.Add(p.Name); break;
-            case "scaleMul" when TryFloat(p.Value, out var f): _settings.ScaleMul = f; applied.Add(p.Name); break;
-                case "offX" when TryFloat(p.Value, out var f): _settings.OffX = f; applied.Add(p.Name); break;
-                case "offY" when TryFloat(p.Value, out var f): _settings.OffY = f; applied.Add(p.Name); break;
+                // Calibration: the scale must stay positive (0 collapses the map to a point, negative mirrors
+                // it) and the offsets on-screen-ish; TryFloat already rejects non-finite values.
+                case "scaleMul" when TryFloat(p.Value, out var f): _settings.ScaleMul = Math.Clamp(f, 0.05f, 20f); applied.Add(p.Name); break;
+                case "offX" when TryFloat(p.Value, out var f): _settings.OffX = Math.Clamp(f, -10000f, 10000f); applied.Add(p.Name); break;
+                case "offY" when TryFloat(p.Value, out var f): _settings.OffY = Math.Clamp(f, -10000f, 10000f); applied.Add(p.Name); break;
                 case "showMonsters" when TryBool(p.Value, out var b): _settings.ShowMonsters = b; applied.Add(p.Name); break;
                 case "showTerrain" when TryBool(p.Value, out var b): _settings.ShowTerrain = b; applied.Add(p.Name); break;
                 case "showPlayerBlip" when TryBool(p.Value, out var b): _settings.ShowPlayerBlip = b; applied.Add(p.Name); break;
-                case "fpsCap" when TryInt(p.Value, out var n): _settings.FpsCap = Math.Clamp(n, 15, 360); applied.Add(p.Name); break;
+                case "hideInHideout" when TryBool(p.Value, out var b): _settings.HideInHideout = b; applied.Add(p.Name); break;
+                // 0 (or less) = AUTO: match the monitor the game is on (RadarSettings.FpsCap); else a fixed cap.
+                case "fpsCap" when TryInt(p.Value, out var n): _settings.FpsCap = n <= 0 ? 0 : Math.Clamp(n, 15, 360); applied.Add(p.Name); break;
                 case "hpBarNormal" when TryBool(p.Value, out var b): _settings.HpBarNormal = b; applied.Add(p.Name); break;
                 case "hpBarMagic" when TryBool(p.Value, out var b): _settings.HpBarMagic = b; applied.Add(p.Name); break;
                 case "hpBarRare" when TryBool(p.Value, out var b): _settings.HpBarRare = b; applied.Add(p.Name); break;
@@ -663,12 +690,16 @@ public sealed class ApiServer : IDisposable
         styles = new RadarStyles();
         try
         {
-            var parsed = JsonSerializer.Deserialize<RadarStyles>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<RadarStyles>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
             foreach (var ic in new[] { parsed.MonsterNormal, parsed.MonsterMagic, parsed.MonsterRare, parsed.MonsterUnique,
                                        parsed.Player, parsed.Npc, parsed.ChestRare, parsed.ChestUnique, parsed.Transition, parsed.Poi, parsed.Landmark })
+            {
+                if (ic is null) return false;   // an explicit JSON null icon — reject the object, don't throw
                 SanitizeIcon(ic);
+            }
             parsed.Mechanics ??= new List<MechanicStyle>();
+            parsed.Mechanics.RemoveAll(mech => mech is null);
             if (parsed.Mechanics.Count > 24) parsed.Mechanics = parsed.Mechanics.Take(24).ToList();
             foreach (var m in parsed.Mechanics)
             {
@@ -702,6 +733,11 @@ public sealed class ApiServer : IDisposable
         s.Size = Math.Clamp(s.Size, 0.5f, 40f);
     }
 
+    /// <summary>Clamp a posted value to a finite, non-negative number (a non-finite one — e.g. the Infinity
+    /// that "1e999" parses to — becomes 0; it could not be written back to the settings file as JSON).</summary>
+    private static double NonNeg(double v) => double.IsFinite(v) ? Math.Max(0, v) : 0;
+    private static float NonNeg(float v) => float.IsFinite(v) ? Math.Max(0f, v) : 0f;
+
     /// <summary>Return <paramref name="c"/> upper-cased if it's a valid #RRGGBB, else <paramref name="fallback"/>.</summary>
     private static string ValidHexOr(string? c, string fallback)
         => c != null && HexColor.IsMatch(c) ? c.ToUpperInvariant() : fallback;
@@ -712,7 +748,7 @@ public sealed class ApiServer : IDisposable
         hp = new HpBarSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<HpBarSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<HpBarSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
             parsed.Height = Math.Clamp(parsed.Height, 1f, 30f);
             parsed.OffsetX = Math.Clamp(parsed.OffsetX, -200f, 200f);
@@ -742,7 +778,7 @@ public sealed class ApiServer : IDisposable
         t = new TerrainSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<TerrainSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<TerrainSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
             parsed.InteriorColor = parsed.InteriorColor != null && HexColor.IsMatch(parsed.InteriorColor) ? parsed.InteriorColor.ToUpperInvariant() : "#506482";
             parsed.EdgeColor = parsed.EdgeColor != null && HexColor.IsMatch(parsed.EdgeColor) ? parsed.EdgeColor.ToUpperInvariant() : "#3CDCFF";
@@ -759,12 +795,12 @@ public sealed class ApiServer : IDisposable
         m = new MonolithSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<MonolithSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<MonolithSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
-            parsed.HighlightMinEx = Math.Max(0, parsed.HighlightMinEx);
-            parsed.MinRewardEx = Math.Max(0, parsed.MinRewardEx);
-            parsed.MinValueEx = Math.Max(0, parsed.MinValueEx);
-            parsed.PanelMaxDistance = Math.Max(0, parsed.PanelMaxDistance);
+            parsed.HighlightMinEx = NonNeg(parsed.HighlightMinEx);
+            parsed.MinRewardEx = NonNeg(parsed.MinRewardEx);
+            parsed.MinValueEx = NonNeg(parsed.MinValueEx);
+            parsed.PanelMaxDistance = NonNeg(parsed.PanelMaxDistance);
             m = parsed;
             return true;
         }
@@ -776,12 +812,12 @@ public sealed class ApiServer : IDisposable
         g = new GroundItemSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<GroundItemSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<GroundItemSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
-            parsed.HighlightMinEx = Math.Max(0, parsed.HighlightMinEx);
-            parsed.UniqueMinEx = Math.Max(0, parsed.UniqueMinEx);
-            parsed.CurrencyMinEx = Math.Max(0, parsed.CurrencyMinEx);
-            parsed.OtherMinEx = Math.Max(0, parsed.OtherMinEx);
+            parsed.HighlightMinEx = NonNeg(parsed.HighlightMinEx);
+            parsed.UniqueMinEx = NonNeg(parsed.UniqueMinEx);
+            parsed.CurrencyMinEx = NonNeg(parsed.CurrencyMinEx);
+            parsed.OtherMinEx = NonNeg(parsed.OtherMinEx);
             parsed.MinQuantity = Math.Clamp(parsed.MinQuantity, 0, 100000);
             parsed.League = (parsed.League ?? "").Trim();
             parsed.Categories = (parsed.Categories ?? new())
@@ -799,9 +835,9 @@ public sealed class ApiServer : IDisposable
         h = new HoverPriceSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<HoverPriceSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<HoverPriceSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
-            parsed.HighlightMinEx = Math.Max(0, parsed.HighlightMinEx);
+            parsed.HighlightMinEx = NonNeg(parsed.HighlightMinEx);
             h = parsed;
             return true;
         }
@@ -815,7 +851,7 @@ public sealed class ApiServer : IDisposable
         c = new CurrencyExchangeSettings();
         try
         {
-            var parsed = JsonSerializer.Deserialize<CurrencyExchangeSettings>(el.GetRawText(), Json);
+            var parsed = JsonSerializer.Deserialize<CurrencyExchangeSettings>(el.GetRawText(), JsonLenient);
             if (parsed == null) return false;
             parsed.MaxRows = Math.Clamp(parsed.MaxRows, 1, 64);
             c = parsed;
@@ -908,7 +944,8 @@ public sealed class ApiServer : IDisposable
         }
         if (!root.TryGetProperty("rules", out var arr) || arr.ValueKind != JsonValueKind.Array) return;
 
-        var list = JsonSerializer.Deserialize<List<DisplayRule>>(arr.GetRawText(), Json) ?? new();
+        var list = JsonSerializer.Deserialize<List<DisplayRule>>(arr.GetRawText(), JsonLenient) ?? new();
+        list.RemoveAll(rule => rule is null);   // a JSON null entry — skip it rather than throw in SanitizeRule
         if (list.Count > 300) list = list.GetRange(0, 300); // sanity cap
         foreach (var r in list) SanitizeRule(r);
         _displayRules.Replace(list);
@@ -994,28 +1031,127 @@ public sealed class ApiServer : IDisposable
 
     private static bool TryFloat(JsonElement e, out float v)
     {
-        if (e.ValueKind == JsonValueKind.Number && e.TryGetSingle(out v)) return true;
+        // Finite only: an overflowing literal ("1e999") parses to Infinity, which no setting can use.
+        if (e.ValueKind == JsonValueKind.Number && e.TryGetSingle(out v) && float.IsFinite(v)) return true;
         v = 0f; return false;
     }
 
     private static bool TryInt(JsonElement e, out int v)
     {
-        if (e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out v)) return true;
+        if (e.ValueKind == JsonValueKind.Number)
+        {
+            if (e.TryGetInt32(out v)) return true;
+            // A fractional number for an integer setting (a number input can produce "2.5"): round it
+            // rather than silently ignoring the write.
+            if (e.TryGetDouble(out var d) && double.IsFinite(d))
+            {
+                v = (int)Math.Clamp(Math.Round(d), int.MinValue, int.MaxValue);
+                return true;
+            }
+        }
         v = 0; return false;
     }
 
+    /// <summary>
+    /// Gate for every state-changing request. Returns true when the write may proceed; otherwise it has
+    /// already written the rejection (403 / 415 / 413) and the caller must stop. Three independent checks:
+    /// <list type="bullet">
+    /// <item>Host is a loopback name — a DNS-rebound page still sends its own hostname in Host.</item>
+    /// <item>Origin, when present, is a loopback origin on OUR port. Browsers attach Origin to every
+    ///   cross-origin POST, so another site's page (which the Host check alone lets through — its request
+    ///   really is addressed to localhost) is refused. Absent = a non-browser client (curl, scripts).</item>
+    /// <item>Content-Type is application/json. That is not a CORS "simple" type, so a foreign page cannot
+    ///   send it without a preflight, and we never answer a preflight with an allow header.</item>
+    /// </list>
+    /// </summary>
+    private bool AllowWrite(HttpListenerContext ctx)
+    {
+        var req = ctx.Request;
+        if (!IsLoopbackHost(req))
+        {
+            Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden host" }, Json));
+            return false;
+        }
+        if (!IsAllowedOrigin(req))
+        {
+            Write(ctx, 403, JsonSerializer.Serialize(new { error = "forbidden origin" }, Json));
+            return false;
+        }
+        if (!IsJsonContent(req))
+        {
+            Write(ctx, 415, JsonSerializer.Serialize(new { error = "Content-Type must be application/json" }, Json));
+            return false;
+        }
+        if (req.ContentLength64 > MaxBodyBytes)
+        {
+            Write(ctx, 413, JsonSerializer.Serialize(new { error = "request body too large" }, Json));
+            return false;
+        }
+        return true;
+    }
+
+    private static bool IsLoopbackName(string name)
+        => name.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+           || name is "127.0.0.1" or "[::1]" or "::1";
 
     private static bool IsLoopbackHost(HttpListenerRequest req)
     {
-        var host = req.UserHostName; // includes port, e.g. "localhost:7777"
+        var host = req.UserHostName; // includes port, e.g. "localhost:7777" or "[::1]:7777"
         if (string.IsNullOrEmpty(host)) return false;
-        var name = host.Split(':')[0];
-        return name is "localhost" or "127.0.0.1" or "[::1]" or "::1";
+        host = host.Trim();
+        string name;
+        if (host.StartsWith('['))
+        {
+            // Bracketed IPv6 literal: the name is everything up to and including the closing bracket.
+            var end = host.IndexOf(']');
+            name = end > 0 ? host[..(end + 1)] : host;
+        }
+        else
+        {
+            // "name" or "name:port". More than one colon without brackets is a bare IPv6 literal (no port).
+            var colon = host.IndexOf(':');
+            name = colon >= 0 && colon == host.LastIndexOf(':') ? host[..colon] : host;
+        }
+        return IsLoopbackName(name);
     }
 
+    /// <summary>True when the request carries no Origin header, or one naming a loopback http origin on
+    /// this server's own port (i.e. the dashboard we served). "null" (opaque/sandboxed origins) and any
+    /// other site are refused.</summary>
+    private bool IsAllowedOrigin(HttpListenerRequest req)
+    {
+        var origin = req.Headers["Origin"];
+        if (string.IsNullOrEmpty(origin)) return true;
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var u)) return false;
+        return u.Scheme == Uri.UriSchemeHttp && u.Port == _port && IsLoopbackName(u.Host);
+    }
+
+    private static bool IsJsonContent(HttpListenerRequest req)
+    {
+        var ct = req.ContentType;
+        if (string.IsNullOrEmpty(ct)) return false;
+        var semi = ct.IndexOf(';');
+        var media = (semi >= 0 ? ct[..semi] : ct).Trim();
+        return media.Equals("application/json", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Read the request body as text, refusing anything over <see cref="MaxBodyBytes"/>
+    /// (<see cref="RequestTooLargeException"/> → 413 in <see cref="Loop"/>). The cap is enforced while
+    /// reading too, so a chunked body with no Content-Length can't grow without bound.</summary>
     private static string ReadBody(HttpListenerContext ctx)
     {
-        using var r = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
+        var req = ctx.Request;
+        if (req.ContentLength64 > MaxBodyBytes) throw new RequestTooLargeException();
+        using var ms = new MemoryStream();
+        var buf = new byte[8192];
+        int n;
+        while ((n = req.InputStream.Read(buf, 0, buf.Length)) > 0)
+        {
+            if (ms.Length + n > MaxBodyBytes) throw new RequestTooLargeException();
+            ms.Write(buf, 0, n);
+        }
+        ms.Position = 0;
+        using var r = new StreamReader(ms, req.ContentEncoding);
         return r.ReadToEnd();
     }
 

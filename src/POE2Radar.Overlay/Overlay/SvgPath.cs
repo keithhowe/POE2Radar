@@ -30,7 +30,9 @@ internal static class SvgPath
         public bool Closed;
     }
 
-    /// <summary>Parse a path <c>d</c> string. Returns an empty list on null/garbage (never throws).</summary>
+    /// <summary>Parse a path <c>d</c> string. Returns an empty list on null/garbage (never throws, and
+    /// always terminates: every loop iteration consumes at least one character — see the progress guard
+    /// at the bottom of the loop).</summary>
     public static List<SvgFigure> Parse(string? d)
     {
         var figs = new List<SvgFigure>();
@@ -53,6 +55,11 @@ internal static class SvgPath
             SkipSep(d, ref i);
             if (i >= n) break;
 
+            // Where this iteration started. A case that fails to read its arguments just breaks out
+            // WITHOUT skipping anything itself (so a command letter that cut the arguments short is still
+            // seen as a command next time round); the guard after the switch then guarantees progress.
+            int iterStart = i;
+
             var c = d[i];
             if (char.IsLetter(c)) { cmd = c; i++; SkipSep(d, ref i); }
             else if (cmd == '\0') { i++; continue; } // leading garbage
@@ -64,7 +71,7 @@ internal static class SvgPath
             {
                 case 'M':
                 {
-                    if (!ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                    if (!ReadPoint(d, ref i, cur, rel, out var p)) break;
                     cur = p; start = p;
                     fig = new SvgFigure { Start = cur }; figs.Add(fig);
                     cmd = rel ? 'l' : 'L'; // subsequent implicit pairs are line-to
@@ -73,14 +80,14 @@ internal static class SvgPath
                 }
                 case 'L':
                 {
-                    if (!ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                    if (!ReadPoint(d, ref i, cur, rel, out var p)) break;
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Line, default, default, p));
                     cur = p; hadCubic = hadQuad = false;
                     break;
                 }
                 case 'H':
                 {
-                    if (!TryReadFloat(d, ref i, out var x)) { i++; break; }
+                    if (!TryReadFloat(d, ref i, out var x)) break;
                     var p = new Vector2(rel ? cur.X + x : x, cur.Y);
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Line, default, default, p));
                     cur = p; hadCubic = hadQuad = false;
@@ -88,7 +95,7 @@ internal static class SvgPath
                 }
                 case 'V':
                 {
-                    if (!TryReadFloat(d, ref i, out var y)) { i++; break; }
+                    if (!TryReadFloat(d, ref i, out var y)) break;
                     var p = new Vector2(cur.X, rel ? cur.Y + y : y);
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Line, default, default, p));
                     cur = p; hadCubic = hadQuad = false;
@@ -98,7 +105,7 @@ internal static class SvgPath
                 {
                     if (!ReadPoint(d, ref i, cur, rel, out var c1) ||
                         !ReadPoint(d, ref i, cur, rel, out var c2) ||
-                        !ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                        !ReadPoint(d, ref i, cur, rel, out var p)) break;
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Cubic, c1, c2, p));
                     prevCubicCtrl = c2; cur = p; hadCubic = true; hadQuad = false;
                     break;
@@ -106,7 +113,7 @@ internal static class SvgPath
                 case 'S':
                 {
                     if (!ReadPoint(d, ref i, cur, rel, out var c2) ||
-                        !ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                        !ReadPoint(d, ref i, cur, rel, out var p)) break;
                     var c1 = hadCubic ? cur + (cur - prevCubicCtrl) : cur; // reflect previous control
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Cubic, c1, c2, p));
                     prevCubicCtrl = c2; cur = p; hadCubic = true; hadQuad = false;
@@ -115,14 +122,14 @@ internal static class SvgPath
                 case 'Q':
                 {
                     if (!ReadPoint(d, ref i, cur, rel, out var c1) ||
-                        !ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                        !ReadPoint(d, ref i, cur, rel, out var p)) break;
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Quad, c1, default, p));
                     prevQuadCtrl = c1; cur = p; hadQuad = true; hadCubic = false;
                     break;
                 }
                 case 'T':
                 {
-                    if (!ReadPoint(d, ref i, cur, rel, out var p)) { i++; break; }
+                    if (!ReadPoint(d, ref i, cur, rel, out var p)) break;
                     var c1 = hadQuad ? cur + (cur - prevQuadCtrl) : cur;
                     EnsureFig(); fig!.Segs.Add(new Seg(SegKind.Quad, c1, default, p));
                     prevQuadCtrl = c1; cur = p; hadQuad = true; hadCubic = false;
@@ -130,26 +137,34 @@ internal static class SvgPath
                 }
                 case 'A':
                 {
+                    // The large-arc and sweep flags are single '0'/'1' characters that may abut the next
+                    // number with no separator ("a9 9 0 11-18 0", as minifiers write it) — NOT floats.
                     if (!TryReadFloat(d, ref i, out var rx) || !TryReadFloat(d, ref i, out var ry) ||
-                        !TryReadFloat(d, ref i, out var rot) || !TryReadFloat(d, ref i, out var laf) ||
-                        !TryReadFloat(d, ref i, out var sf) || !ReadPoint(d, ref i, cur, rel, out var p))
-                    { i++; break; }
+                        !TryReadFloat(d, ref i, out var rot) || !TryReadFlag(d, ref i, out var largeArc) ||
+                        !TryReadFlag(d, ref i, out var sweep) || !ReadPoint(d, ref i, cur, rel, out var p))
+                        break;
                     EnsureFig();
-                    foreach (var seg in ArcToCubics(cur, rx, ry, rot, laf != 0f, sf != 0f, p))
+                    foreach (var seg in ArcToCubics(cur, rx, ry, rot, largeArc, sweep, p))
                         fig!.Segs.Add(seg);
                     cur = p; hadCubic = hadQuad = false;
                     break;
                 }
                 case 'Z':
                 {
+                    // Takes no arguments, so it consumes nothing beyond its own letter. Anything that is not
+                    // a command after it (stray number/punctuation) is dropped by the progress guard below.
                     if (fig is not null) { fig.Closed = true; cur = start; }
                     fig = null; hadCubic = hadQuad = false;
                     break;
                 }
                 default:
-                    i++; // unknown command — skip a char and continue
-                    break;
+                    break; // unknown command — its letter was consumed above; stray chars fall to the guard
             }
+
+            // Progress guard: an iteration that consumed nothing (a stray char after Z, an argument that
+            // isn't a number, garbage under an unknown command) skips one character, so the loop always
+            // terminates no matter what the input is.
+            if (i == iterStart) i++;
         }
         return figs;
     }
@@ -189,7 +204,21 @@ internal static class SvgPath
             while (i < n && char.IsDigit(s[i])) i++;
         }
         if (!any) { i = st; return false; }
-        return float.TryParse(s.AsSpan(st, i - st), NumberStyles.Float, CultureInfo.InvariantCulture, out v);
+        // Reject overflow ("1e999" parses to Infinity) so no non-finite coordinate ever reaches geometry.
+        return float.TryParse(s.AsSpan(st, i - st), NumberStyles.Float, CultureInfo.InvariantCulture, out v)
+               && float.IsFinite(v);
+    }
+
+    /// <summary>Read one arc flag: exactly one '0' or '1' character (SVG grammar), which may be followed
+    /// immediately by the next number. Consumes nothing on failure.</summary>
+    private static bool TryReadFlag(string s, ref int i, out bool flag)
+    {
+        flag = false;
+        int st = i;
+        SkipSep(s, ref i);
+        if (i < s.Length && (s[i] == '0' || s[i] == '1')) { flag = s[i] == '1'; i++; return true; }
+        i = st;
+        return false;
     }
 
     private static bool ReadPoint(string s, ref int i, Vector2 cur, bool rel, out Vector2 p)
@@ -242,6 +271,18 @@ internal static class SvgPath
         float dtheta = Angle(ux, uy, vx, vy);
         if (!sweep && dtheta > 0f) dtheta -= 2f * MathF.PI;
         else if (sweep && dtheta < 0f) dtheta += 2f * MathF.PI;
+
+        // Near-coincident endpoints: the angle between them rounds to 0 in float, and the control-point
+        // factor below would be 0/0 = NaN. With the large-arc flag that is the single-arc "full circle"
+        // idiom (end point a hair away from the start), so sweep the whole ellipse; otherwise the arc is
+        // a degenerate sliver — draw it as a line. Same line fallback if the centre math overflowed.
+        if (!float.IsFinite(cx) || !float.IsFinite(cy) || !float.IsFinite(theta1) || !float.IsFinite(dtheta)
+            || (MathF.Abs(dtheta) < 1e-6f && !largeArc))
+        {
+            yield return new Seg(SegKind.Line, default, default, p1);
+            yield break;
+        }
+        if (MathF.Abs(dtheta) < 1e-6f) dtheta = sweep ? 2f * MathF.PI : -2f * MathF.PI;
 
         int segs = Math.Max(1, (int)MathF.Ceiling(MathF.Abs(dtheta) / (MathF.PI / 2f)));
         float delta = dtheta / segs;

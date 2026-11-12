@@ -214,6 +214,7 @@ internal static class DashboardHtml
   .hint-row{color:var(--ink-faint)!important; font-size:11px!important; font-style:italic}
   .saved{font-size:10px; letter-spacing:.18em; text-transform:uppercase; color:var(--good); opacity:0; transition:opacity .3s}
   .saved.show{opacity:1}
+  .saved.bad{color:var(--blood-bright)}
 
   /* ── icon / mechanic style editors ── */
   .stylerow{display:flex; align-items:center; gap:9px; padding:9px 0; border-bottom:1px dotted var(--line-soft); flex-wrap:wrap}
@@ -559,6 +560,8 @@ internal static class DashboardHtml
               <label class="sw"><input type="checkbox" data-set="showTerrain"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Show player blip<small>blue dot marking your own position</small></div>
               <label class="sw"><input type="checkbox" data-set="showPlayerBlip"><span class="track"></span><span class="knob"></span></label></div>
+            <div class="row"><div class="rl">Hide in hideout<small>no radar, HP bars, routes or nav menu while in a hideout; the atlas overlay and price chips still show</small></div>
+              <label class="sw"><input type="checkbox" data-set="hideInHideout"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Always show overlay<small>draw even when PoE2 isn&rsquo;t focused (e.g. while tweaking this dashboard); auto-flask stays focus-gated</small></div>
               <label class="sw"><input type="checkbox" data-set="alwaysShowOverlay"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Hide junk entities<small>suppress cosmetic / FX / daemon dots</small></div>
@@ -567,8 +570,8 @@ internal static class DashboardHtml
               <label class="sw"><input type="checkbox" data-set="showPath"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Curated landmark names<small>community labels (boss / reward / exits)</small></div>
               <label class="sw"><input type="checkbox" data-set="useCuratedLandmarks"><span class="track"></span><span class="knob"></span></label></div>
-            <div class="row"><div class="rl">Overlay FPS cap<small>lower = less load on the game; 60 is smooth for a radar (15&ndash;360)</small></div>
-              <input class="numin" type="number" step="1" min="15" max="360" data-set="fpsCap"></div>
+            <div class="row"><div class="rl">Overlay FPS cap<small>0 = auto (match the monitor the game is on); otherwise a fixed cap, 15&ndash;360 &mdash; lower = less load on the game</small></div>
+              <input class="numin" type="number" step="1" min="0" max="360" data-set="fpsCap"></div>
             <div class="row"><div class="rl">Label declutter radius<small>entities matching the same rule within this many screen px share one label, drawn &ldquo;Name &times;N&rdquo; &mdash; every dot still draws. Stops multi-part set pieces (e.g. Act&nbsp;2&rsquo;s 9-part caravan) stacking identical text. 0 = off (0&ndash;300)</small></div>
               <input class="numin" type="number" step="4" min="0" max="300" data-set="labelDeclusterPx"></div>
           </div>
@@ -663,8 +666,10 @@ internal static class DashboardHtml
             <div class="row"><div class="rl hint-row">These apply to <b>everything priced</b> below &mdash; ground loot, hover, monolith &amp; ritual rewards. Prices come from poe.ninja for the detected league.</div></div>
             <div class="row"><div class="rl">Price league<small>leave blank to auto-detect your league (HC/SC/Standard) from the game</small></div>
               <input class="numin" type="text" id="giLeague" data-gi="league" placeholder="auto-detect" style="width:200px"></div>
-            <div class="row"><div class="rl">Low-listing warning<small>flag a price backed by fewer than N live listings with a &ldquo;?&rdquo; (possible mislisting). 0 = never flag</small></div>
+            <div class="row"><div class="rl">Minimum trades to trust a price<small>a price backed by fewer than N units traded (currency, runes, gems&hellip;) or N listings (uniques) is treated as unreliable. 0 = trust everything</small></div>
               <input class="numin" type="number" step="1" min="0" data-gi="minQuantity"></div>
+            <div class="row"><div class="rl">Hide unreliable prices<small>on: show no value at all for them on ground loot, loot tags, monolith / ritual / rune rewards. off: show the value with a &ldquo;?&rdquo;. Hover prices always show with a &ldquo;?&rdquo;</small></div>
+              <label class="sw"><input type="checkbox" data-gi="hideLowConfidence"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl hint-row">Pricing status: <span id="priceStatus" style="color:var(--ink-dim)">&mdash;</span></div></div>
           </div>
 
@@ -751,7 +756,12 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 let state=null, zone=null;
 let activeTab='filters';
-let atlasData=null, atlasView='region', atlasSel=new Set(), atlasHl=null, atlasNav=null, atlasArrow=null, atlasHlSelOnly=false, atlasGroup='all';
+let atlasData=null, atlasView='region', atlasSel=new Set(), atlasHl=new Set(), atlasNav=new Set(), atlasArrow=new Set(), atlasHlSelOnly=false, atlasGroup='all';
+// Atlas rule state mirrored from the overlay (the source of truth): lower-cased tag → original-case tag /
+// ring colour. atlasRulesSynced gates every POST so we never overwrite rules we haven't read yet;
+// atlasHlEpoch/atlasHlPending let a re-read notice it raced a local edit and leave the sets alone.
+const atlasTitles={}, atlasColors={};
+let atlasRulesSynced=false, atlasHlEpoch=0, atlasHlPending=0;
 
 /* ── tabs ── */
 $$('.tab').forEach(t=>t.onclick=()=>{
@@ -786,7 +796,13 @@ async function loadSettings(){
     $$('[data-set]').forEach(el=>{
       const k=el.dataset.set;
       if(el.type==='checkbox') el.checked=!!s[k];
-      else if(el.classList.contains('keyin')) el.value=vkToChar(s[k]);
+      else if(el.classList.contains('keyin')){
+        // A stored code with no single-character name (e.g. one saved by an older build) shows blank,
+        // with the raw code in the placeholder/tooltip so it's clear a key IS bound — type one to rebind.
+        el.value=vkToChar(s[k]);
+        const raw=(!el.value && s[k]) ? '0x'+Number(s[k]).toString(16).toUpperCase() : '';
+        el.placeholder=raw; el.title=raw ? 'bound to virtual-key '+raw+' — type a key to rebind' : '';
+      }
       else if(s[k]!==undefined) el.value=s[k];
     });
     hpBars = s.hpBars || null;
@@ -817,7 +833,7 @@ function wireGround(){
     const k=el.dataset.gi;
     if(el.type==='checkbox') el.onchange=()=>{ gi=gi||{}; gi[k]=el.checked; saveGround(); };
     else if(el.type==='text') el.onchange=()=>{ gi=gi||{}; gi[k]=el.value.trim(); saveGround(); };
-    else el.onchange=()=>{ const v=parseFloat(el.value); if(!isNaN(v)){ gi=gi||{}; gi[k]=v; saveGround(); } };
+    else el.onchange=()=>{ const v=numVal(el,k); if(!isNaN(v)){ gi=gi||{}; gi[k]=v; saveGround(); } };
   });
   $$('#giCats .chip').forEach(c=>c.onclick=()=>{
     c.classList.toggle('on');
@@ -892,28 +908,67 @@ function wireExchange(){
   $$('[data-ce]').forEach(el=>{
     const k=el.dataset.ce;
     if(el.type==='checkbox') el.onchange=()=>{ ce=ce||{}; ce[k]=el.checked; saveExchange(); };
-    else el.onchange=()=>{ const v=parseFloat(el.value); if(!isNaN(v)){ ce=ce||{}; ce[k]=v; saveExchange(); } };
+    else el.onchange=()=>{ const v=numVal(el,k); if(!isNaN(v)){ ce=ce||{}; ce[k]=v; saveExchange(); } };
   });
 }
+// Settings the server stores as INTEGERS. A number input happily yields "2.5"; round it (and show the
+// rounded value) so a fractional value can never sit in a cached sub-object and fail every later save.
+const INT_KEYS=new Set(['fpsCap','lifeCooldownMs','manaCooldownMs','landmarkClusterGap','minQuantity','maxRows']);
+function numVal(el,k){ let v=parseFloat(el.value); if(!isNaN(v) && INT_KEYS.has(k)){ v=Math.round(v); el.value=v; } return v; }
+// Show the outcome of a save on a "saved" indicator: green tick when the server applied it, red
+// "not saved" (held a little longer) when it rejected or ignored the write, or the request failed.
+function flashEl(m,ok){
+  if(!m) return;
+  if(m.dataset.okText===undefined) m.dataset.okText=m.textContent;
+  m.textContent = ok ? m.dataset.okText : '✗ not saved';
+  m.classList.toggle('bad',!ok);
+  m.classList.add('show'); clearTimeout(m._t); m._t=setTimeout(()=>m.classList.remove('show'), ok?1100:2600);
+}
+// Flash every settings "saved" indicator (one per tab) — only the visible tab's is seen.
+function flashSaved(ok){ ['#savedMsg','#savedMsg2'].forEach(id=>flashEl($(id),ok)); }
+// POST one setting. Resolves true only when the server reports the key in its `applied` list — a 4xx/5xx,
+// an ignored key, or a rejected sub-object all count as NOT saved, and the form is re-read from the
+// server so the page never keeps showing (or re-posting) a value that wasn't accepted.
 async function saveSetting(key,val){
+  let ok=false;
   try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:val})});
-    // Flash every on-page "saved" indicator (one per tab) — only the visible tab's is seen.
-    $$('.saved').forEach(m=>{ m.classList.add('show'); clearTimeout(m._t); m._t=setTimeout(()=>m.classList.remove('show'),1100); });
-  }catch(e){}
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:val})});
+    if(r.ok){ const j=await r.json(); ok=Array.isArray(j&&j.applied) && j.applied.includes(key); }
+  }catch(e){ ok=false; }
+  flashSaved(ok);
+  if(!ok) loadSettings();
+  return ok;
 }
 function wireSettings(){
   $$('[data-set]').forEach(el=>{
     const k=el.dataset.set;
     if(el.type==='checkbox') el.onchange=()=>saveSetting(k,el.checked);
-    else if(el.classList.contains('keyin')) el.onchange=()=>{ const vk=charToVk(el.value); if(vk) saveSetting(k,vk); el.value=vkToChar(vk); };
+    else if(el.classList.contains('keyin')) el.onchange=()=>{
+      const vk=charToVk(el.value);
+      if(vk){ el.value=vkToChar(vk); el.placeholder=''; el.title=''; saveSetting(k,vk); }
+      else { flashSaved(false); loadSettings(); }   // not a bindable key — restore what is stored
+    };
     else if(el.tagName==='SELECT') el.onchange=()=>saveSetting(k,el.value); // string value (e.g. flask mode)
-    else el.onchange=()=>{ const v=parseFloat(el.value); if(!isNaN(v)) saveSetting(k,v); };
+    else el.onchange=()=>{ const v=numVal(el,k); if(!isNaN(v)) saveSetting(k,v); };
   });
 }
-// Flask key inputs accept a single character ('1'-'9', letters) → Win32 VK (== ASCII of uppercase).
-const charToVk = s => { const c=(s||'').trim().toUpperCase().charCodeAt(0); return isNaN(c)?0:c; };
-const vkToChar = v => v ? String.fromCharCode(v) : '';
+// Flask key inputs accept a single character → Win32 virtual-key code. Digits and letters ARE their own
+// VK (ASCII of the uppercase); the punctuation keys have dedicated VK_OEM_* codes (US layout) — their
+// ASCII values are different keys entirely ('-' is 0x2D = VK_INSERT, '[' is 0x5B = VK_LWIN). Anything
+// else is rejected (0). vkToChar is the inverse; an unmapped stored code renders blank.
+const VK_PUNCT={'-':0xBD,'=':0xBB,'[':0xDB,']':0xDD,';':0xBA,"'":0xDE,',':0xBC,'.':0xBE,'/':0xBF,'\\':0xDC,'`':0xC0};
+const VK_PUNCT_REV={}; Object.keys(VK_PUNCT).forEach(c=>VK_PUNCT_REV[VK_PUNCT[c]]=c);
+const charToVk = s => {
+  const ch=(s||'').trim().charAt(0); if(!ch) return 0;
+  if(Object.prototype.hasOwnProperty.call(VK_PUNCT,ch)) return VK_PUNCT[ch];
+  const u=ch.toUpperCase();
+  return /^[0-9A-Z]$/.test(u) ? u.charCodeAt(0) : 0;
+};
+const vkToChar = v => {
+  v=+v; if(!v) return '';
+  if(VK_PUNCT_REV[v]) return VK_PUNCT_REV[v];
+  return ((v>=0x30&&v<=0x39)||(v>=0x41&&v<=0x5A)) ? String.fromCharCode(v) : '';
+};
 
 /* ── icon / HP-bar / mechanics editors (nested objects: POST the whole {styles}/{hpBars}) ── */
 let styles=null, hpBars=null, terrain=null;
@@ -1080,8 +1135,8 @@ function renderMechanics(){
 }
 /* ── Rules tab: unified Display Rules + Hidden cull patterns ── */
 let hidden=[], drules=[];
-function flashF(){ const m=$('#savedMsgF'); if(!m) return; m.classList.add('show'); clearTimeout(m._t); m._t=setTimeout(()=>m.classList.remove('show'),1100); }
-async function postHidden(body){ try{ await fetch('/api/hidden',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); flashF(); }catch(e){} }
+function flashF(ok=true){ flashEl($('#savedMsgF'),ok); }
+async function postHidden(body){ try{ const r=await fetch('/api/hidden',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); flashF(r.ok); }catch(e){ flashF(false); } }
 async function loadFilters(){
   await loadModVocab();   // populate the mods autocomplete BEFORE rendering rule rows reference it
   await loadDrules();
@@ -1102,7 +1157,7 @@ async function loadModVocab(){
 const DR_CATS=['Monster','Chest','Npc','Object','Other','Transition','Player','Tile'];
 const DR_SELECTS=[['rarity','Rarity',['Normal','Magic','Rare','Unique']],['reaction','Reaction',['Hostile','Friendly']],
   ['life','Life',['Alive','Dead']],['chest','Chest',['Opened','Unopened']],['poi','POI',['Yes','No']],['encounter','Encounter',['Active','Complete']]];
-async function saveDrules(){ try{ await fetch('/api/display-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rules:drules})}); flashF(); }catch(e){} }
+async function saveDrules(){ try{ const r=await fetch('/api/display-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rules:drules})}); flashF(r.ok); }catch(e){ flashF(false); } }
 async function loadDrules(){ try{ const r=await getJSON('/api/display-rules'); drules=r.rules||[]; }catch(e){ drules=[]; } renderDrules(); }
 function drSel(f,l,o,cur){ return `<label class="drsel">${l}<select class="dr-cond" data-f="${f}"><option value=""${!cur?' selected':''}>any</option>`
   +o.map(x=>`<option${cur===x?' selected':''}>${x}</option>`).join('')+`</select></label>`; }
@@ -1279,14 +1334,14 @@ $('#hidePattern').onkeydown=e=>{ if(e.key==='Enter') $('#hideAdd').click(); };
 
 /* ── Landmarks tab: view/edit the curated map-label table (baked + user overlay) + import/export ── */
 let lmEntries=[], lmAreaOnly=true, lmQ='';
-function flashL(){ const m=$('#savedMsgL'); if(!m) return; m.classList.add('show'); clearTimeout(m._t); m._t=setTimeout(()=>m.classList.remove('show'),1100); }
+function flashL(ok=true){ flashEl($('#savedMsgL'),ok); }
 async function loadLandmarks(){
   try{ const r=await getJSON('/api/landmarks'); lmEntries=r.entries||[]; }catch(e){ lmEntries=[]; }
   const a=$('#lmArea'); if(a && !a.value) a.value=(state&&state.areaCode)||'';
   renderLandmarks();
 }
 async function postLandmarks(body){
-  try{ const r=await fetch('/api/landmarks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const j=await r.json(); if(j&&j.entries) lmEntries=j.entries; flashL(); }catch(e){}
+  try{ const r=await fetch('/api/landmarks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const j=await r.json(); if(j&&j.entries) lmEntries=j.entries; flashL(r.ok); }catch(e){ flashL(false); }
   renderLandmarks();
 }
 function lmRow(e){
@@ -1374,8 +1429,27 @@ document.querySelector('#atlasGroupAdd')?.addEventListener('click',()=>{ atlasGr
 async function loadAtlas(){
   $('#atlasStatus').textContent='reading…';
   if(!atlasOptsWired){ atlasOptsWired=true; wireAtlasOpts(); }
+  const epoch=atlasHlEpoch;
   try{ atlasData=await getJSON('/api/atlas'); }catch(e){ atlasData={located:false,note:'request failed'}; }
+  // Re-sync the active rules from the overlay on every read (it also seeds/edits them itself) — unless
+  // a local edit was made or is still being posted since this read started (it would be clobbered).
+  if(epoch===atlasHlEpoch && atlasHlPending===0) syncAtlasRules(atlasData);
   renderAtlas();
+}
+// Mirror the overlay's persisted atlas rules into the page: the three tag sets (lower-cased keys), each
+// tag's original casing, and — when the server exposes them (highlightColors: {tag:'#RRGGBB'}) — the
+// per-rule ring colours. A payload without the tag lists (a failed request) leaves everything untouched
+// and unsynced, which blocks posting, so a failed read can never lead to the rules being overwritten.
+function syncAtlasRules(d){
+  if(!d || !Array.isArray(d.highlightTags)) return;
+  const low=a=>(Array.isArray(a)?a:[]).map(t=>{ const k=(t||'').toLowerCase(); if(k) atlasTitles[k]=t; return k; }).filter(Boolean);
+  atlasHl=new Set(low(d.highlightTags)); atlasNav=new Set(low(d.navTags)); atlasArrow=new Set(low(d.arrowTags));
+  const hc=d.highlightColors;
+  if(hc && typeof hc==='object'){
+    Object.keys(atlasColors).forEach(k=>delete atlasColors[k]);
+    Object.keys(hc).forEach(t=>{ if(hc[t]) atlasColors[t.toLowerCase()]=hc[t]; });
+  }
+  atlasRulesSynced=true;
 }
 function renderAtlas(){
   const d=atlasData; if(!d){ return; }
@@ -1383,8 +1457,9 @@ function renderAtlas(){
   if(!(nd&&nd.total)) st.textContent = d.note ? 'scanning…' : 'atlas closed — open it in-game + Refresh';
   else st.textContent = nd.total+' nodes · '+nd.hasContent+' with content · '
         +(d.allKinds?.length||0)+' kind / '+(d.allTags?.length||0)+' content / '+(d.allMaps?.length||0)+' map filters';
-  // Seed active rules from the overlay (once): tracked + arrow sets. Then render the filter table.
-  if(atlasHl===null){ atlasHl=new Set((d.highlightTags||[]).map(t=>t.toLowerCase())); atlasNav=new Set((d.navTags||[]).map(t=>t.toLowerCase())); atlasArrow=new Set((d.arrowTags||[]).map(t=>t.toLowerCase())); }
+  // The active rules are mirrored from the overlay by loadAtlas (syncAtlasRules); this is only the
+  // fallback for a first read that raced an edit. Then render the filter table.
+  if(!atlasRulesSynced) syncAtlasRules(d);
   renderAtlasHighlight(d);
   renderAtlasRouteList(d);
 }
@@ -1548,18 +1623,33 @@ function updateHlCount(){
   if(keys.size===0){ box.innerHTML='<span class="hint-row" style="opacity:.6">No active rules &mdash; click a row or a Quick set.</span>'; return; }
   // Recover original-case titles from the data.
   const titleOf={}; (atlasData?atlasFilterRows(atlasData):[]).forEach(r=>titleOf[r.title.toLowerCase()]=r.title);
-  const chip=k=>{ const t=titleOf[k]||k; const marks=(atlasHl.has(k)?'<span title="Highlight">&#9745;</span>':'')+(atlasNav.has(k)?'<span style="color:#3ddc97" title="Nav">&#8674;</span>':'')+(atlasArrow.has(k)?'<span style="color:#e0b341" title="Arrow">&#10148;</span>':'');
+  const chip=k=>{ const t=titleOf[k]||atlasTitles[k]||k; const marks=(atlasHl.has(k)?'<span title="Highlight">&#9745;</span>':'')+(atlasNav.has(k)?'<span style="color:#3ddc97" title="Nav">&#8674;</span>':'')+(atlasArrow.has(k)?'<span style="color:#e0b341" title="Arrow">&#10148;</span>':'');
     return '<span class="achip" data-k="'+esc(k)+'" style="display:inline-flex;align-items:center;gap:5px;padding:3px 7px;margin:0 5px 5px 0;border:1px solid var(--line);border-radius:12px;font-size:12px;background:rgba(60,160,255,.10)">'+marks+'<b>'+esc(t)+'</b><span class="achipx" data-k="'+esc(k)+'" style="cursor:pointer;opacity:.6;font-weight:700">&times;</span></span>'; };
   box.innerHTML=[...keys].sort().map(chip).join('');
   $$('#atlasActive .achipx').forEach(x=>x.onclick=()=>{ const k=x.dataset.k; atlasHl.delete(k); atlasNav.delete(k); atlasArrow.delete(k); renderAtlasHighlight(atlasData); postAtlasHighlight(); });
 }
-// Push the active rules (original-case) to the overlay.
+// Push the active rules (original-case) to the overlay. The server REPLACES its whole rule set with what
+// we send, so the list is built from the ACTIVE SETS — never from the rows in the current atlas payload:
+// with the Atlas closed (no rows) or a tracked tag absent from the current nodes, a row-derived list would
+// silently delete every rule it couldn't see.
 async function postAtlasHighlight(){
-  // Build {tag,color,track,nav,arrow} rules: colour = the row's category colour, so in-game rings match the table.
-  const rows=atlasData?atlasFilterRows(atlasData):[];
-  const rules=rows.filter(r=>{const k=r.title.toLowerCase(); return atlasHl.has(k)||atlasNav.has(k)||atlasArrow.has(k);})
-    .map(r=>{const k=r.title.toLowerCase(); return {tag:r.title, color:(CATCOL[r.cat]||'#3ca0ff'), track:atlasHl.has(k), nav:atlasNav.has(k), arrow:atlasArrow.has(k)};});
+  if(!atlasRulesSynced) return;   // never read the overlay's rules → posting would overwrite them blind
+  atlasHlEpoch++;
+  const rowBy={}; (atlasData?atlasFilterRows(atlasData):[]).forEach(r=>{ const k=r.title.toLowerCase(); if(!rowBy[k]) rowBy[k]=r; });
+  const keys=new Set([...atlasHl,...atlasNav,...atlasArrow]);
+  Object.keys(atlasColors).forEach(k=>{ if(!keys.has(k)) delete atlasColors[k]; });   // forget removed rules' colours
+  // {tag,color,track,nav,arrow}. Colour: the rule's existing colour if it has one (so seeded/per-rule
+  // colours survive an unrelated toggle), else the row's category colour so in-game rings match the table;
+  // unknown (no stored colour, tag not in the payload) is sent blank = "no per-rule colour".
+  const rules=[...keys].map(k=>{
+    const r=rowBy[k]; if(r) atlasTitles[k]=r.title;
+    const color=atlasColors[k]||(r?(CATCOL[r.cat]||'#3ca0ff'):'');
+    if(color) atlasColors[k]=color;
+    return {tag:atlasTitles[k]||k, color, track:atlasHl.has(k), nav:atlasNav.has(k), arrow:atlasArrow.has(k)};
+  });
+  atlasHlPending++;
   try{ await fetch('/api/atlas-highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rules})}); }catch(e){}
+  finally{ atlasHlPending--; }
 }
 $('#atlasHlClear')?.addEventListener('click',()=>{ atlasHl.clear(); atlasNav.clear(); atlasArrow.clear(); if(atlasData) renderAtlasHighlight(atlasData); postAtlasHighlight(); });
 $('#atlasHlFilter')?.addEventListener('input',()=>{ if(atlasData) renderAtlasHighlight(atlasData); });
@@ -1640,7 +1730,7 @@ function renderState(){
   $('#cPoi').textContent=s.poiCount||0;
   $('#cMon').textContent=(s.counts&&s.counts.Monster)||0;
   $('#cLm').textContent=s.landmarkCount||0;
-  $('#areaChip').innerHTML = (areaName||s.areaCode||'—') + ' <b>·</b> ' + (s.inGame?'in game':'town/menu');
+  $('#areaChip').innerHTML = esc(areaName||s.areaCode||'—') + ' <b>·</b> ' + (s.inGame?'in game':'town/menu');
 
   // Runeshape monoliths (from /state): each monolith's value-tier header (best ex · anchor · N holes)
   // with its priced reward rows. Sorted server-side by value; hidden when the area has none.

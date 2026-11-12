@@ -29,6 +29,11 @@ public sealed class RouteTracker
     private const double HeadingWindowSec    = 0.3;   // sliding window for the player's heading estimate
     private const float  HeadingMinCells     = 2f;    // ignore heading below this magnitude (standing still)
     private const float  NegativeProgressDot = -0.3f; // heading·toGoal below this = walking the wrong way
+    // A plan that came back EMPTY (goal unreachable / search budget exhausted) is retried on a doubling
+    // backoff instead of at the anti-thrash floor: a failed A* is the WORST-case search (it runs to the
+    // node budget), so retrying it ~3×/s would pin the replanner worker and starve every other target.
+    private const double EmptyBackoffMinSec  = 1.0;   // first retry after a failed plan
+    private const double EmptyBackoffMaxSec  = 10.0;  // cap for the doubling backoff
 
     /// <summary>Current smoothed waypoints (full path; <see cref="_cursor"/> marks how far we've walked).</summary>
     private List<(int x, int y)> _waypoints = new();
@@ -36,6 +41,11 @@ public sealed class RouteTracker
     private DateTime _lastReplanUtc = DateTime.MinValue;
     private NumVec2 _lastGoal = new(float.MinValue, float.MinValue);
     private NumVec2 _lastReplanStart = new(float.MinValue, float.MinValue); // player pos when the last plan was requested
+
+    // Consecutive EMPTY plan results toward (materially) the same goal. 0 = the last result had a route, or
+    // nothing has been planned yet — which is how "never planned" is told apart from "planned, no route".
+    private int _emptyStreak;
+    private double _emptyBackoffSec;
 
     // Short heading history (recent player positions + capture times, ~HeadingWindowSec window).
     private readonly List<(NumVec2 pos, DateTime at)> _history = new();
@@ -68,23 +78,41 @@ public sealed class RouteTracker
         {
             var a = ToVec(_waypoints[_cursor]);                 // node we're currently heading to
             if (NumVec2.Distance(playerGrid, a) <= ReachedCells) { _cursor++; continue; }   // reached it
-            var ab = ToVec(_waypoints[_cursor + 1]) - a;        // direction toward the node after
-            if (ab.LengthSquared() > 1e-3f && NumVec2.Dot(playerGrid - a, ab) > 0f) { _cursor++; continue; } // walked past it
+
+            // "Walked past it" is measured along the segment we ARRIVE on (previous node → a): we are past
+            // a once we are beyond it in the direction we were travelling. It must NOT be measured along
+            // the segment that LEAVES a — where the path doubles back at a (a hairpin round a wall end)
+            // that direction points back toward us, so a player still approaching a would count as "past"
+            // it and the route would collapse into a straight line through the wall.
+            // The plan's first node has no incoming segment (it is where we stood when the plan was
+            // requested), so it alone uses the outgoing direction: consumed as soon as we set off along it.
+            var along = _cursor > 0
+                ? a - ToVec(_waypoints[_cursor - 1])            // incoming direction into a
+                : ToVec(_waypoints[_cursor + 1]) - a;           // first node: direction of the first leg
+            if (along.LengthSquared() <= 1e-3f) { _cursor++; continue; }                    // duplicate node
+            if (NumVec2.Dot(playerGrid - a, along) > 0f) { _cursor++; continue; }           // walked past it
             break;
         }
     }
 
     /// <summary>
     /// Should we kick off a full background replan? Gated only by the hard anti-thrash floor; past that,
-    /// any trigger fires immediately so the route never lags: empty path, the goal moved, off-path,
-    /// walking the wrong way, or the periodic staleness refresh.
+    /// any trigger fires immediately so the route never lags: never planned, the goal moved, off-path,
+    /// walking the wrong way, or the periodic staleness refresh. The one exception is a plan that came
+    /// back EMPTY: that is retried on a doubling backoff (see <see cref="EmptyBackoffMinSec"/>), unless
+    /// the goal has moved materially since it failed.
     /// </summary>
     public bool ShouldReplan(NumVec2 playerGrid, NumVec2 currentGoalGrid)
     {
         var sinceReplan = (DateTime.UtcNow - _lastReplanUtc).TotalSeconds;
         if (sinceReplan < MinReplanSpacingSec) return false;   // hard anti-thrash floor only
 
-        if (_waypoints.Count == 0) return true;                 // never planned / empty
+        if (_waypoints.Count == 0)
+        {
+            if (_emptyStreak == 0) return true;                 // never planned
+            if (GoalMoved(currentGoalGrid)) return true;        // failed, but the goal is somewhere else now
+            return sinceReplan >= _emptyBackoffSec;             // failed: wait out the backoff, then retry
+        }
         if (GoalMoved(currentGoalGrid)) return true;            // entity target drifted
         if (OffPath(playerGrid)) return true;                   // wandered off the line
         if (NegativeProgress(playerGrid)) return true;          // walking the wrong way
@@ -93,9 +121,24 @@ public sealed class RouteTracker
         return false;
     }
 
-    /// <summary>Swap in a freshly-planned path: reset the cursor, stamp the replan time + goal, clear in-flight.</summary>
+    /// <summary>Swap in a freshly-planned path: reset the cursor, stamp the replan time + goal, clear in-flight.
+    /// An EMPTY <paramref name="waypoints"/> means the planner found no route: it is recorded as a failure
+    /// (distinct from "never planned") and lengthens the retry backoff — doubling from
+    /// <see cref="EmptyBackoffMinSec"/> to <see cref="EmptyBackoffMaxSec"/> while the goal stays put, and
+    /// starting over when the goal has moved materially or a real route arrives.</summary>
     public void ApplyResult(IReadOnlyList<(int x, int y)> waypoints, NumVec2 goal)
     {
+        if (waypoints.Count == 0)
+        {
+            var sameGoal = _emptyStreak > 0 && NumVec2.Distance(goal, _lastGoal) <= GoalMovedCells;
+            _emptyStreak = sameGoal ? Math.Min(_emptyStreak + 1, 16) : 1;
+            _emptyBackoffSec = Math.Min(EmptyBackoffMaxSec, EmptyBackoffMinSec * Math.Pow(2, _emptyStreak - 1));
+        }
+        else
+        {
+            _emptyStreak = 0;
+            _emptyBackoffSec = 0;
+        }
         _waypoints = new List<(int x, int y)>(waypoints);
         _cursor = 0;
         _lastReplanUtc = DateTime.UtcNow;
@@ -149,8 +192,10 @@ public sealed class RouteTracker
         var heading = playerGrid - _history[0].pos;     // oldest → current over the window
         if (heading.Length() < HeadingMinCells) return false;
 
-        // Direction to the next un-walked waypoint.
-        var nextIdx = Math.Min(_cursor + 1, _waypoints.Count - 1);
+        // Direction to the next un-walked waypoint — the cursor node itself (Maintain keeps the cursor on
+        // the node we are heading TO, so cursor+1 would be the node AFTER it and would misread every leg
+        // that precedes a sharp turn as "walking the wrong way").
+        var nextIdx = Math.Min(_cursor, _waypoints.Count - 1);
         var toGoal = ToVec(_waypoints[nextIdx]) - playerGrid;
         if (toGoal.Length() < 1e-3f) return false;
 

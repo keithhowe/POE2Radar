@@ -142,6 +142,9 @@ public sealed record RenderContext(
     bool ShowMonsters,
     bool ShowTerrain,
     bool ShowPlayerBlip,
+    // True → skip the whole world-radar pass this frame (hideout with "Hide in hideout" on). The atlas
+    // overlay and the screen-space price chips are unaffected.
+    bool HideRadar,
     // Monster HP-bar (nameplate) toggles by rarity.
     bool HpBarNormal,
     bool HpBarMagic,

@@ -76,7 +76,12 @@ public sealed class OverlayRenderer : IDisposable
     private ID2D1SolidColorBrush? _bPath;  // recolored per route via SetColor
     private ID2D1SolidColorBrush? _bStyle; // scratch brush for config-driven icons / HP bars (recolored per draw)
     private IDWriteTextFormat? _tf;
-    private bool _ready;
+    private bool _ready;   // the DEVICE-DEPENDENT resources (brushes) exist for the current render target
+
+    // Device-loss / failed-frame recovery (see Render). _failedFrames counts consecutive frames that
+    // could not be drawn; after the first one the recovery is retried at most once per second.
+    private int _failedFrames;
+    private long _retryAtTick;
 
     public OverlayRenderer(OverlayWindow window) { _window = window; }
 
@@ -84,6 +89,7 @@ public sealed class OverlayRenderer : IDisposable
     {
         if (_ready) return;
         var rt = _window.RenderTarget;
+        // Device-dependent: owned by the render target, rebuilt whenever it is recreated.
         _bPlayer   = rt.CreateSolidColorBrush(ColPlayer);
         _bOther    = rt.CreateSolidColorBrush(ColOther);
         _bText     = rt.CreateSolidColorBrush(ColText);
@@ -91,21 +97,76 @@ public sealed class OverlayRenderer : IDisposable
         _bLandmark = rt.CreateSolidColorBrush(ColLandmark);
         _bPath     = rt.CreateSolidColorBrush(PathPalette[0]);
         _bStyle    = rt.CreateSolidColorBrush(ColText);
-        _tf = _window.DWriteFactory.CreateTextFormat("Consolas", null, FontWeight.Normal, FontStyle.Normal, FontStretch.Normal, 12f, "en-us");
-        _atlasIcons = new AtlasIconCache();   // decode embedded atlas content PNGs once (#5)
+        // Device-INDEPENDENT (DirectWrite format, decoded icon pixels): created once, survive device loss.
+        if (_tf is null)
+        {
+            _tf = _window.DWriteFactory.CreateTextFormat("Consolas", null, FontWeight.Normal, FontStyle.Normal, FontStretch.Normal, 12f, "en-us");
+            // Single-line labels: text that doesn't fit its layout rect is CLIPPED at the edge, never
+            // wrapped onto a second line (which the rect's height would hide, dropping whole words).
+            // Explicit '\n' line breaks still apply.
+            _tf.WordWrapping = WordWrapping.NoWrap;
+        }
+        _atlasIcons ??= new AtlasIconCache();   // decode embedded atlas content PNGs once (#5)
         _ready = true;
+    }
+
+    /// <summary>Release everything created FROM the render target (brushes, the terrain bitmap, the atlas
+    /// icon bitmaps) so it can be rebuilt on a new one. Path geometries (factory-owned) and the text
+    /// format (DirectWrite) are device-independent and are kept.</summary>
+    private void ReleaseDeviceResources()
+    {
+        _bPlayer?.Dispose(); _bOther?.Dispose(); _bText?.Dispose(); _bPanel?.Dispose(); _bLandmark?.Dispose();
+        _bPath?.Dispose(); _bStyle?.Dispose();
+        _bPlayer = _bOther = _bText = _bPanel = _bLandmark = _bPath = _bStyle = null;
+        _terrain?.Dispose(); _terrain = null;          // holds the old target; rebuilt lazily in DrawMap
+        _atlasIcons?.ReleaseDeviceResources();         // bitmaps re-materialize from the decoded pixels
+        _ready = false;
+    }
+
+    /// <summary>A frame could not be drawn: the device was lost (<c>EndDraw</c> →
+    /// D2DERR_RECREATE_TARGET — GPU driver reset, adapter change, RDP switch) or a device resource could
+    /// not be created. Drop every device-dependent resource, rebuild the render target, and blank the
+    /// overlay so the last good frame isn't left frozen over the game; the next frame starts clean.</summary>
+    private void OnFrameFailed(string why)
+    {
+        if (_failedFrames++ == 0)
+            Console.Error.WriteLine($"Overlay: frame failed ({why}) — recreating the Direct2D render target.");
+        _retryAtTick = Environment.TickCount64 + 1000;
+        _legendRowRects.Clear();            // nothing was presented → no click rects
+        ReleaseDeviceResources();
+        _window.TryRecreateRenderTarget();  // false (device still gone) → IsValid false → retried in Render
+        _window.PresentCleared();
     }
 
     public void Render(RenderContext ctx)
     {
-        if (!_window.IsValid) return;
-        EnsureResources();
+        // Recovering from failed frames: the first retry is immediate (the usual case — one lost frame),
+        // after that at most once a second so a device that stays unavailable isn't hammered.
+        if (_failedFrames > 1 && Environment.TickCount64 < _retryAtTick) return;
+        if (!_window.IsValid)
+        {
+            // No render target: lost and not yet rebuilt (or the window is gone). Anything still held
+            // belongs to the dead target.
+            ReleaseDeviceResources();
+            if (!_window.TryRecreateRenderTarget())
+            {
+                _failedFrames++;
+                _retryAtTick = Environment.TickCount64 + 1000;
+                return;
+            }
+        }
+
         var rt = _window.RenderTarget;
-        rt.BeginDraw();
-        rt.Clear(new Color4(0f, 0f, 0f, 0f));
-        rt.TextAntialiasMode = Vortice.Direct2D1.TextAntialiasMode.Grayscale;
+        var began = false;
+        string? failure = null;
         try
         {
+            EnsureResources();
+            rt.BeginDraw();
+            began = true;
+            rt.Clear(new Color4(0f, 0f, 0f, 0f));
+            rt.TextAntialiasMode = Vortice.Direct2D1.TextAntialiasMode.Grayscale;
+
             // Draw nothing unless PoE2 is the foreground window — so the overlay never shows
             // over other apps when you alt-tab. (The cleared frame above hides prior content.)
             if (ctx.Active && ctx.InGame && ctx.AtlasOpen)
@@ -116,9 +177,9 @@ public sealed class OverlayRenderer : IDisposable
                 DrawAtlas(rt, ctx);                        // tracked-map rings + off-screen arrows
                 _legendRowRects.Clear();
             }
-            else if (ctx.Active && ctx.InGame)
+            else if (ctx.Active && ctx.InGame && !ctx.HideRadar)
             {
-                DrawNameplates(rt, ctx);                   // world-space HP bars over hostile mobs
+                DrawNameplates(rt, ctx);                  // world-space HP bars over hostile mobs
                 DrawItemLabels(rt, ctx);                   // priced unique drops over their loot icons
                 if (ctx.Map.IsVisible)
                     DrawMap(rt, ctx);                      // terrain + dots + on-map path polylines
@@ -131,7 +192,7 @@ public sealed class OverlayRenderer : IDisposable
             }
             else
             {
-                _legendRowRects.Clear(); // not active/in-game: no stale click rects
+                _legendRowRects.Clear(); // not active/in-game, or radar hidden (hideout): no stale click rects
             }
 
             // Rune-crafting reward prices: screen-space labels drawn on top of whatever's below (radar
@@ -146,7 +207,31 @@ public sealed class OverlayRenderer : IDisposable
                 DrawCurrencyExchange(rt, ctx);         // currency-exchange order-book depth panel (top-right, screen-space)
             }
         }
-        finally { rt.EndDraw(); }
+        catch (SharpGen.Runtime.SharpGenException ex)
+        {
+            // A Direct2D call that reports an HRESULT (creating a brush / the terrain bitmap) failed
+            // mid-frame — in practice the device going away between frames. Same recovery as a failed
+            // EndDraw. (Anything else is a real bug and still propagates, after EndDraw below.)
+            failure = $"Direct2D call failed 0x{ex.HResult:X8}";
+        }
+        finally
+        {
+            // EndDraw returns the frame's HRESULT rather than throwing: D2DERR_RECREATE_TARGET here is
+            // how Direct2D reports device loss, and it MUST be acted on — every later frame fails too.
+            if (began)
+            {
+                var hr = rt.EndDraw();
+                if (hr.Failure) failure ??= $"EndDraw 0x{hr.Code:X8}";
+            }
+        }
+
+        if (failure is not null)
+        {
+            // Never present a frame whose EndDraw failed: the DIB still holds the PREVIOUS frame.
+            OnFrameFailed(failure);
+            return;
+        }
+        _failedFrames = 0;
         _window.Present();
     }
 
@@ -225,13 +310,23 @@ public sealed class OverlayRenderer : IDisposable
                     var carry = spacing * phase;   // reset per segment so the phase is honoured on every edge
                     DrawAtlasChevrons(rt, a, b, col, chevron, spacing, ref carry);
                 }
+                // START disc on the route's first node — the runnable map this route begins from. Routes start
+                // at the runnable frontier, not at the player, so without this there is no way to tell which
+                // end of a line to run first. (Shared starts just overdraw the same disc.)
+                var src = pts[0];
+                if (On(src, 0f))
+                {
+                    _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(src, 7f, 7f), _bStyle, 4f);
+                    _bStyle.Color = green; rt.DrawEllipse(new Ellipse(src, 7f, 7f), _bStyle, 2.5f);
+                    rt.FillEllipse(new Ellipse(src, 2.5f, 2.5f), _bStyle);
+                }
                 // Hop-count chip at the target end (only when the target is on-screen).
                 var tgt = pts[^1];
                 if (On(tgt, 0f))
                 {
                     string ht = ar.Hops.ToString();
                     rt.FillRectangle(new Vortice.RawRectF(tgt.X - 11f, tgt.Y - 26f, tgt.X + 11f, tgt.Y - 10f), _bPanel!);
-                    rt.DrawText(ht, _tf!, new Rect(tgt.X - 9f, tgt.Y - 26f, tgt.X + 11f, tgt.Y - 10f), _bText!, DrawTextOptions.Clip);
+                    rt.DrawText(ht, _tf!, Rect.FromLTRB(tgt.X - 9f, tgt.Y - 26f, tgt.X + 11f, tgt.Y - 10f), _bText!, DrawTextOptions.Clip);
                 }
             }
         }
@@ -270,10 +365,35 @@ public sealed class OverlayRenderer : IDisposable
         if (current is { } cur)
         {
             var p = Proj(cur);
-            _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(p, 11f, 11f), _bStyle, 4.5f);
-            _bStyle.Color = new Color4(0.3f, 0.95f, 1f, 1f);
-            rt.DrawEllipse(new Ellipse(p, 11f, 11f), _bStyle, 2.5f);
-            rt.FillEllipse(new Ellipse(p, 3f, 3f), _bStyle);
+            var youCol = new Color4(0.3f, 0.95f, 1f, 1f);
+            if (On(p, 0f))
+            {
+                _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(p, 16f, 16f), _bStyle, 5.5f);
+                _bStyle.Color = youCol;
+                rt.DrawEllipse(new Ellipse(p, 16f, 16f), _bStyle, 3f);
+                rt.DrawEllipse(new Ellipse(p, 9f, 9f), _bStyle, 1.5f);
+                rt.FillEllipse(new Ellipse(p, 3.5f, 3.5f), _bStyle);
+                // Labelled, because a bare ring reads as just another highlight among the tracked-map rings.
+                rt.FillRectangle(new Vortice.RawRectF(p.X - 17f, p.Y + 19f, p.X + 17f, p.Y + 35f), _bPanel!);
+                rt.DrawText("YOU", _tf!, Rect.FromLTRB(p.X - 11f, p.Y + 19f, p.X + 17f, p.Y + 35f), _bStyle, DrawTextOptions.Clip);
+            }
+            else
+            {
+                // Off-screen: a "YOU" chip pinned to the screen edge in its direction, so you can pan to it.
+                var c = new NumVec2(W * 0.5f, H * 0.5f);
+                var d = p - c; var len = d.Length();
+                if (len > 1f && float.IsFinite(len))
+                {
+                    d /= len;
+                    float tx = d.X != 0 ? ((d.X > 0 ? W - 40f : 40f) - c.X) / d.X : float.MaxValue;
+                    float ty = d.Y != 0 ? ((d.Y > 0 ? H - 30f : 30f) - c.Y) / d.Y : float.MaxValue;
+                    var e2 = c + d * MathF.Min(tx, ty);
+                    rt.FillRectangle(new Vortice.RawRectF(e2.X - 22f, e2.Y - 9f, e2.X + 22f, e2.Y + 9f), _bPanel!);
+                    _bStyle!.Color = youCol;
+                    rt.DrawRectangle(new Vortice.RawRectF(e2.X - 22f, e2.Y - 9f, e2.X + 22f, e2.Y + 9f), _bStyle, 1.5f);
+                    rt.DrawText("YOU", _tf!, Rect.FromLTRB(e2.X - 11f, e2.Y - 8f, e2.X + 22f, e2.Y + 9f), _bStyle, DrawTextOptions.Clip);
+                }
+            }
         }
     }
 
@@ -356,7 +476,7 @@ public sealed class OverlayRenderer : IDisposable
                 float lx = sx + 24f, ly = sy - 9f;
                 float lw = label.Length * 7.0f + 8f;
                 rt.FillRectangle(new Vortice.RawRectF(lx - 4f, ly - 1f, lx + lw, ly + 17f), _bPanel!);
-                rt.DrawText(label, _tf!, new Rect(lx, ly, lx + lw + 40f, ly + 18f), _bText!, DrawTextOptions.Clip);
+                rt.DrawText(label, _tf!, Rect.FromLTRB(lx, ly, lx + lw + 40f, ly + 18f), _bText!, DrawTextOptions.Clip);
             }
         }
     }
@@ -380,7 +500,8 @@ public sealed class OverlayRenderer : IDisposable
         {
             var bmp = _atlasIcons!.Get(rt, bn);
             if (bmp == null) continue;
-            // Vortice's Rect ctor is (x, y, WIDTH, HEIGHT) — NOT (left, top, right, bottom) — and this
+            // Vortice's Rect ctor is (x, y, WIDTH, HEIGHT) — NOT (left, top, right, bottom); every DrawText
+            // layout rect in this file is therefore built with Rect.FromLTRB. This
             // overload's rect is the DESTINATION (whole bitmap drawn as source). The old call passed an
             // LTRB-shaped rect to the source-only overload with no destination, so the icon drew at the
             // screen origin at native size while sampling a garbage region → invisible (only the panel showed).
@@ -472,10 +593,11 @@ public sealed class OverlayRenderer : IDisposable
             // it stays readable over the map art and doesn't clip off the edge like the bare text did.
             float lw = label.Length * 7.0f + 8f;
             float lx = ex - ux * 30f - lw * 0.5f, ly = ey - uy * 22f - 9f;
-            lx = Math.Clamp(lx, 2f, W - lw - 2f);
-            ly = Math.Clamp(ly, 2f, H - 20f);
+            // Math.Max on the upper bound: Math.Clamp THROWS when max < min (label wider than the window).
+            lx = Math.Clamp(lx, 2f, Math.Max(2f, W - lw - 2f));
+            ly = Math.Clamp(ly, 2f, Math.Max(2f, H - 20f));
             rt.FillRectangle(new Vortice.RawRectF(lx - 3f, ly - 1f, lx + lw, ly + 17f), _bPanel!);
-            rt.DrawText(label, _tf!, new Rect(lx, ly, lx + lw + 40f, ly + 18f), _bText!, DrawTextOptions.Clip);
+            rt.DrawText(label, _tf!, Rect.FromLTRB(lx, ly, lx + lw + 40f, ly + 18f), _bText!, DrawTextOptions.Clip);
         }
     }
 
@@ -554,7 +676,7 @@ public sealed class OverlayRenderer : IDisposable
                 rt.FillRectangle(panel, _bPanel!);
                 if (it.Highlight) { _bStyle!.Color = ColItemHi; rt.DrawRectangle(panel, _bStyle, 2.5f); }
                 _bStyle!.Color = it.Highlight ? ColItemHi : ColItemText;
-                rt.DrawText(text, _tf!, new Rect(sx - halfW + 4f, sy - halfH + 2f, sx + halfW - 2f, sy + halfH - 1f),
+                rt.DrawText(text, _tf!, Rect.FromLTRB(sx - halfW + 4f, sy - halfH + 2f, sx + halfW - 2f, sy + halfH - 1f),
                     _bStyle, DrawTextOptions.Clip);
             }
             else
@@ -567,7 +689,7 @@ public sealed class OverlayRenderer : IDisposable
                 rt.FillRectangle(panel, _bPanel!);
                 if (it.Highlight) { _bStyle!.Color = ColItemHi; rt.DrawRectangle(panel, _bStyle, 2f); }
                 _bStyle!.Color = it.Highlight ? ColItemHi : ColItemText;
-                rt.DrawText(it.Value, _tf!, new Rect(sx - halfW + 3f, sy - halfH + 1f, sx + halfW - 2f, sy + halfH),
+                rt.DrawText(it.Value, _tf!, Rect.FromLTRB(sx - halfW + 3f, sy - halfH + 1f, sx + halfW - 2f, sy + halfH),
                     _bStyle, DrawTextOptions.Clip);
             }
         }
@@ -590,7 +712,7 @@ public sealed class OverlayRenderer : IDisposable
             var box = new Vortice.RawRectF(lx, cy - boxH * 0.5f, lx + boxW, cy + boxH * 0.5f);
             rt.FillRectangle(box, _bPanel!);
             _bStyle!.Color = ColorFromU(r.Color);
-            rt.DrawText(r.Text, _tf!, new Rect(lx + 5f, cy - boxH * 0.5f + 2f, lx + boxW - 2f, cy + boxH * 0.5f - 1f),
+            rt.DrawText(r.Text, _tf!, Rect.FromLTRB(lx + 5f, cy - boxH * 0.5f + 2f, lx + boxW - 2f, cy + boxH * 0.5f - 1f),
                 _bStyle, DrawTextOptions.Clip);
         }
     }
@@ -611,7 +733,7 @@ public sealed class OverlayRenderer : IDisposable
             rt.FillRectangle(box, _bPanel!);
             if (r.Highlight) { _bStyle!.Color = ColItemHi; rt.DrawRectangle(box, _bStyle, 2f); }
             _bStyle!.Color = ColorFromU(r.Color);
-            rt.DrawText(r.Text, _tf!, new Rect(box.Left + 3f, top + 1f, box.Right - 2f, top + boxH - 1f),
+            rt.DrawText(r.Text, _tf!, Rect.FromLTRB(box.Left + 3f, top + 1f, box.Right - 2f, top + boxH - 1f),
                 _bStyle, DrawTextOptions.Clip);
         }
     }
@@ -634,7 +756,7 @@ public sealed class OverlayRenderer : IDisposable
             rt.FillRectangle(box, _bPanel!);
             if (t.Highlight) { _bStyle!.Color = ColItemHi; rt.DrawRectangle(box, _bStyle, 2f); }
             _bStyle!.Color = t.Highlight ? ColItemHi : ColItemText;
-            rt.DrawText(t.Value, _tf!, new Rect(lx + 4f, cy - boxH * 0.5f + 1f, lx + boxW - 2f, cy + boxH * 0.5f - 1f),
+            rt.DrawText(t.Value, _tf!, Rect.FromLTRB(lx + 4f, cy - boxH * 0.5f + 1f, lx + boxW - 2f, cy + boxH * 0.5f - 1f),
                 _bStyle, DrawTextOptions.Clip);
         }
     }
@@ -655,7 +777,7 @@ public sealed class OverlayRenderer : IDisposable
         // Anchor to the item icon: centre the chip on the slot, just below it; flip above if no room below,
         // and clamp inside the screen so it never runs off an edge.
         var x = hp.X + hp.W * 0.5f - w * 0.5f;
-        x = Math.Clamp(x, 2f, ctx.WindowWidth - w - 2f);
+        x = Math.Clamp(x, 2f, Math.Max(2f, ctx.WindowWidth - w - 2f));   // Max: Clamp throws when max < min (chip wider than the window)
         var y = hp.Y + hp.H + gap;
         if (y + chipH > ctx.WindowHeight - 2f) y = hp.Y - chipH - gap;
         if (y < 2f) y = 2f;
@@ -665,9 +787,9 @@ public sealed class OverlayRenderer : IDisposable
         _bStyle!.Color = hp.Highlight ? ColItemHi : ColItemText;
         rt.DrawRectangle(box, _bStyle, hp.Highlight ? 2f : 1f);
         // Row 1: stack total (emphasis colour). Row 2 (stacks only): per-unit, in dimmer white.
-        rt.DrawText(hp.Text, _tf!, new Rect(x + pad, y + 3f, x + w - pad, y + rowH + 3f), _bStyle, DrawTextOptions.Clip);
+        rt.DrawText(hp.Text, _tf!, Rect.FromLTRB(x + pad, y + 3f, x + w - pad, y + rowH + 3f), _bStyle, DrawTextOptions.Clip);
         if (twoRow)
-            rt.DrawText(hp.Sub, _tf!, new Rect(x + pad, y + rowH + 3f, x + w - pad, y + chipH - 2f), _bText!, DrawTextOptions.Clip);
+            rt.DrawText(hp.Sub, _tf!, Rect.FromLTRB(x + pad, y + rowH + 3f, x + w - pad, y + chipH - 2f), _bText!, DrawTextOptions.Clip);
     }
 
     /// <summary>Unpack a 0xAARRGGBB color (precomputed in RadarApp.BuildHpSpecs) to a Color4 — no string
@@ -687,9 +809,9 @@ public sealed class OverlayRenderer : IDisposable
             _bStyle!.Color = ColorFromU(m.Color);
             rt.DrawEllipse(new Ellipse(p, 9f, 9f), _bStyle, 2.4f);          // value-coloured ring
             rt.DrawText(m.Holes.ToString(), _tf!,                           // N badge (white) inside the ring
-                new Rect(p.X - 4f, p.Y - 8f, p.X + 10f, p.Y + 8f), _bText!, DrawTextOptions.Clip);
+                Rect.FromLTRB(p.X - 4f, p.Y - 8f, p.X + 10f, p.Y + 8f), _bText!, DrawTextOptions.Clip);
             var label = m.BestEx > 0 ? $"{m.BestEx:F0}ex · {m.BestName}" : $"{m.AnchorName} {m.Holes}h";
-            rt.DrawText(label, _tf!, new Rect(p.X + 13f, p.Y - 8f, p.X + 340f, p.Y + 9f), _bStyle, DrawTextOptions.Clip);
+            rt.DrawText(label, _tf!, Rect.FromLTRB(p.X + 13f, p.Y - 8f, p.X + 340f, p.Y + 9f), _bStyle, DrawTextOptions.Clip);
         }
     }
 
@@ -713,7 +835,7 @@ public sealed class OverlayRenderer : IDisposable
             // Collapsed: just the clickable header bar, keeping the count visible for quick reference.
             float ch = pad * 2f + titleH;
             rt.FillRectangle(new Vortice.RawRectF(x, y, x + w, y + ch), _bPanel!);
-            rt.DrawText($"{caret}Monoliths ({monos.Count})", _tf!, new Rect(x + pad, y + pad, x + w - pad, y + pad + titleH), _bText!, DrawTextOptions.Clip);
+            rt.DrawText($"{caret}Monoliths ({monos.Count})", _tf!, Rect.FromLTRB(x + pad, y + pad, x + w - pad, y + pad + titleH), _bText!, DrawTextOptions.Clip);
             _legendRowRects.Add((new Vortice.RawRectF(x, y, x + w, y + ch), "mono-collapse"));
             return;
         }
@@ -729,20 +851,20 @@ public sealed class OverlayRenderer : IDisposable
         rt.FillRectangle(new Vortice.RawRectF(x, y, x + w, y + h), _bPanel!);
 
         float cy = y + pad;
-        rt.DrawText($"{caret}Monoliths ({monos.Count})", _tf!, new Rect(x + pad, cy, x + w - pad, cy + titleH), _bText!, DrawTextOptions.Clip);
+        rt.DrawText($"{caret}Monoliths ({monos.Count})", _tf!, Rect.FromLTRB(x + pad, cy, x + w - pad, cy + titleH), _bText!, DrawTextOptions.Clip);
         _legendRowRects.Add((new Vortice.RawRectF(x, cy, x + w, cy + titleH), "mono-collapse"));
         cy += titleH;
         foreach (var m in list)
         {
             _bStyle!.Color = ColorFromU(m.Color);
             var hdr = m.BestEx > 0 ? $"{m.BestEx:F0}ex · {m.AnchorName} {m.Holes}h" : $"{m.AnchorName} {m.Holes}h";
-            rt.DrawText(hdr, _tf!, new Rect(x + pad, cy, x + w - pad, cy + headH), _bStyle, DrawTextOptions.Clip);
+            rt.DrawText(hdr, _tf!, Rect.FromLTRB(x + pad, cy, x + w - pad, cy + headH), _bStyle, DrawTextOptions.Clip);
             cy += headH;
             var shown = 0;
             foreach (var r in m.Rewards)
             {
                 if (r.Ex <= 0 || shown >= 3) continue;
-                rt.DrawText($"  {r.Ex,4:F0}  {r.Name}", _tf!, new Rect(x + pad, cy, x + w - pad, cy + lineH), _bText!, DrawTextOptions.Clip);
+                rt.DrawText($"  {r.Ex,4:F0}  {r.Name}", _tf!, Rect.FromLTRB(x + pad, cy, x + w - pad, cy + lineH), _bText!, DrawTextOptions.Clip);
                 cy += lineH; shown++;
             }
         }
@@ -787,7 +909,7 @@ public sealed class OverlayRenderer : IDisposable
             _bStyle!.Color = ColExchangeGold;
             rt.FillRectangle(new Vortice.RawRectF(tx, anchorY + tabH - 2f, tx + tabW, anchorY + tabH), _bStyle);  // gold underline
             _bStyle.Color = ColExchangeFill;
-            rt.DrawText("+ Sell Guide", _tf!, new Rect(tx + 7f, anchorY + 2f, tx + tabW - 4f, anchorY + tabH), _bStyle, DrawTextOptions.Clip);
+            rt.DrawText("+ Sell Guide", _tf!, Rect.FromLTRB(tx + 7f, anchorY + 2f, tx + tabW - 4f, anchorY + tabH), _bStyle, DrawTextOptions.Clip);
             _legendRowRects.Add((tab, "exchange-collapse"));
             return;
         }
@@ -809,11 +931,11 @@ public sealed class OverlayRenderer : IDisposable
         // X close button (collapses to the tab), top-right of the card.
         float bx = x + w - 17f;
         _bStyle!.Color = ColExchangeDim;
-        rt.DrawText("X", _tf!, new Rect(bx, y + 2f, x + w, y + 18f), _bStyle, DrawTextOptions.Clip);
+        rt.DrawText("X", _tf!, Rect.FromLTRB(bx, y + 2f, x + w, y + 18f), _bStyle, DrawTextOptions.Clip);
         _legendRowRects.Add((new Vortice.RawRectF(bx - 3f, y + 2f, x + w, y + 19f), "exchange-collapse"));
 
         // Title + Kalguur-gold accent rule (the signature PoE touch); leave room for the X.
-        rt.DrawText("Currency Exchange", _tf!, new Rect(lx, cy, bx - 4f, cy + titleH), _bText!, DrawTextOptions.Clip);
+        rt.DrawText("Currency Exchange", _tf!, Rect.FromLTRB(lx, cy, bx - 4f, cy + titleH), _bText!, DrawTextOptions.Clip);
         cy += titleH;
         _bStyle.Color = ColExchangeGold;
         rt.FillRectangle(new Vortice.RawRectF(lx, cy + 1f, rx, cy + 2.5f), _bStyle);
@@ -828,7 +950,7 @@ public sealed class OverlayRenderer : IDisposable
             sub = $"buy @ {top.Ratio:0.##}:1  ·  bid {buy[0].Ratio:0.##}:1  ·  spread {spreadPct:0.#}%";
         }
         else sub = $"buy @ {top.Ratio:0.##}:1";
-        rt.DrawText(sub, _tf!, new Rect(lx, cy, rx, cy + subH), _bStyle, DrawTextOptions.Clip);
+        rt.DrawText(sub, _tf!, Rect.FromLTRB(lx, cy, rx, cy + subH), _bStyle, DrawTextOptions.Clip);
         cy += subH;
 
         // Hero — the recommended sale ratio for the user's quantity (cyan, the one bold element).
@@ -836,15 +958,15 @@ public sealed class OverlayRenderer : IDisposable
         {
             cy += sepH;
             _bStyle.Color = ColExchangeFill;
-            rt.DrawText(ctx.ExchangeFillNote!, _tf!, new Rect(lx, cy, rx, cy + heroH), _bStyle, DrawTextOptions.Clip);
+            rt.DrawText(ctx.ExchangeFillNote!, _tf!, Rect.FromLTRB(lx, cy, rx, cy + heroH), _bStyle, DrawTextOptions.Clip);
             cy += heroH;
         }
 
         // Depth ladder header + bars (the signature). ratio | bar∝volume | cumulative.
         cy += sepH;
         _bStyle.Color = ColExchangeDim;
-        rt.DrawText("rate", _tf!, new Rect(lx, cy, lx + 52f, cy + headH), _bStyle, DrawTextOptions.Clip);
-        rt.DrawText("depth →", _tf!, new Rect(rx - 96f, cy, rx, cy + headH), _bStyle, DrawTextOptions.Clip);
+        rt.DrawText("rate", _tf!, Rect.FromLTRB(lx, cy, lx + 52f, cy + headH), _bStyle, DrawTextOptions.Clip);
+        rt.DrawText("depth →", _tf!, Rect.FromLTRB(rx - 96f, cy, rx, cy + headH), _bStyle, DrawTextOptions.Clip);
         cy += headH;
 
         const float ratioW = 52f, cumW = 52f, barGap = 6f;
@@ -858,8 +980,11 @@ public sealed class OverlayRenderer : IDisposable
             _bStyle.Color = i == 0 ? ColExchangeRec : i == deepIdx ? ColExchangeVol : ColExchangeBar;
             rt.FillRectangle(new Vortice.RawRectF(barX, cy + 2f, barX + bw, cy + rowH - 2f), _bStyle);
             _bStyle.Color = rowCol;
-            rt.DrawText($"{r.Ratio:0.##}:1", _tf!, new Rect(lx, cy, lx + ratioW, cy + rowH), _bStyle, DrawTextOptions.Clip);
-            rt.DrawText(r.CumStock.ToString("N0"), _tf!, new Rect(rx - cumW, cy, rx, cy + rowH), _bStyle, DrawTextOptions.Clip);
+            // The two NUMERIC cells are deliberately not clipped: their columns hold ~7 characters, and a
+            // ratio or cumulative volume with its last digit cut off ("1,234,56") reads as a different
+            // number. An over-long value overruns its column (as it always did) rather than misreporting.
+            rt.DrawText($"{r.Ratio:0.##}:1", _tf!, Rect.FromLTRB(lx, cy, lx + ratioW, cy + rowH), _bStyle, DrawTextOptions.None);
+            rt.DrawText(r.CumStock.ToString("N0"), _tf!, Rect.FromLTRB(rx - cumW, cy, rx, cy + rowH), _bStyle, DrawTextOptions.None);
             cy += rowH;
         }
     }
@@ -943,25 +1068,35 @@ public sealed class OverlayRenderer : IDisposable
         var factory = (ID2D1Factory)_window.RenderTarget.Factory;
         var geo = factory.CreatePathGeometry();
         bool any = false;
-        using (var sink = geo.Open())
+        try
         {
-            foreach (var d in def.Paths)
-                foreach (var fig in SvgPath.Parse(d))
-                {
-                    sink.BeginFigure(N(fig.Start), FigureBegin.Filled);
-                    foreach (var seg in fig.Segs)
+            using (var sink = geo.Open())
+            {
+                foreach (var d in def.Paths)
+                    foreach (var fig in SvgPath.Parse(d))
                     {
-                        switch (seg.Kind)
+                        sink.BeginFigure(N(fig.Start), FigureBegin.Filled);
+                        foreach (var seg in fig.Segs)
                         {
-                            case SvgPath.SegKind.Line: sink.AddLine(N(seg.End)); break;
-                            case SvgPath.SegKind.Cubic: sink.AddBezier(new BezierSegment { Point1 = N(seg.C1), Point2 = N(seg.C2), Point3 = N(seg.End) }); break;
-                            case SvgPath.SegKind.Quad: sink.AddQuadraticBezier(new QuadraticBezierSegment { Point1 = N(seg.C1), Point2 = N(seg.End) }); break;
+                            switch (seg.Kind)
+                            {
+                                case SvgPath.SegKind.Line: sink.AddLine(N(seg.End)); break;
+                                case SvgPath.SegKind.Cubic: sink.AddBezier(new BezierSegment { Point1 = N(seg.C1), Point2 = N(seg.C2), Point3 = N(seg.End) }); break;
+                                case SvgPath.SegKind.Quad: sink.AddQuadraticBezier(new QuadraticBezierSegment { Point1 = N(seg.C1), Point2 = N(seg.End) }); break;
+                            }
                         }
+                        sink.EndFigure(fig.Closed ? FigureEnd.Closed : FigureEnd.Open);
+                        any = true;
                     }
-                    sink.EndFigure(fig.Closed ? FigureEnd.Closed : FigureEnd.Open);
-                    any = true;
-                }
-            sink.Close();
+                sink.Close();
+            }
+        }
+        catch (SharpGen.Runtime.SharpGenException)
+        {
+            // Geometry is device-independent, so a path Direct2D rejects is a bad ICON, not device loss:
+            // fall back to the Circle (caller) instead of failing — and re-failing — the whole frame.
+            geo.Dispose();
+            return null;
         }
         if (any) return geo;
         geo.Dispose();
@@ -1074,7 +1209,7 @@ public sealed class OverlayRenderer : IDisposable
         {
             _bStyle!.Color = s.Color;
             var text = s.Count > 1 ? $"{s.Text} x{s.Count}" : s.Text;
-            rt.DrawText(text, _tf!, new Rect(s.X + 7, s.Y - 7, s.X + 240, s.Y + 9), _bStyle, DrawTextOptions.Clip);
+            rt.DrawText(text, _tf!, Rect.FromLTRB(s.X + 7, s.Y - 7, s.X + 240, s.Y + 9), _bStyle, DrawTextOptions.Clip);
         }
 
         // Static tile landmarks (boss arena, treasure, …). Each is styled by its matching "Tile"
@@ -1100,7 +1235,7 @@ public sealed class OverlayRenderer : IDisposable
                 // Rule label wins; else curated friendly label (if enabled); else the derived name.
                 var label = tr?.Label is { Length: > 0 } rl ? rl
                           : (ctx.UseCuratedLandmarks && lm.CuratedName is { } c ? c : lm.Name);
-                rt.DrawText(label, _tf!, new Rect(p.X + 7, p.Y - 7, p.X + 240, p.Y + 9), _bStyle, DrawTextOptions.Clip);
+                rt.DrawText(label, _tf!, Rect.FromLTRB(p.X + 7, p.Y - 7, p.X + 240, p.Y + 9), _bStyle, DrawTextOptions.Clip);
             }
         }
 
@@ -1195,8 +1330,11 @@ public sealed class OverlayRenderer : IDisposable
         var chipRect = new Vortice.RawRectF(left + NavPad, headerY, left + NavPad + chipW, headerY + NavHeaderH - 2f);
         rt.FillRectangle(chipRect, _bPanel!);
         rt.DrawRectangle(chipRect, _bPlayer!, 1f);
+        // chipW is sized for the bare name; the "v "/"> " caret makes the caption ~3 px wider than the chip.
+        // Now that the layout rect really clips, give it the same few px of slack the corner buttons get
+        // (+4) so the last letter isn't shaved — the caption draws exactly as it always has.
         rt.DrawText((expanded ? "v " : "> ") + chip, _tf!,
-            new Rect(chipRect.Left + 4f, headerY + 2f, chipRect.Right, headerY + NavHeaderH), _bText!, DrawTextOptions.Clip);
+            Rect.FromLTRB(chipRect.Left + 4f, headerY + 2f, chipRect.Right + 4f, headerY + NavHeaderH), _bText!, DrawTextOptions.Clip);
         _legendRowRects.Add((chipRect, "menu-toggle"));
 
         // Four corner buttons after the chip. The one matching the current corner is highlighted.
@@ -1206,7 +1344,7 @@ public sealed class OverlayRenderer : IDisposable
             var bw = label.Length * 7.3f + 4f;
             var bRect = new Vortice.RawRectF(bx, headerY, bx + bw, headerY + NavHeaderH - 2f);
             var sel = c == corner;
-            rt.DrawText(label, _tf!, new Rect(bRect.Left, headerY + 2f, bRect.Right + 6f, headerY + NavHeaderH),
+            rt.DrawText(label, _tf!, Rect.FromLTRB(bRect.Left, headerY + 2f, bRect.Right + 6f, headerY + NavHeaderH),
                 sel ? _bPlayer! : _bOther!, DrawTextOptions.Clip);
             _legendRowRects.Add((bRect, "corner:" + c));
             bx += bw + 4f;
@@ -1241,7 +1379,7 @@ public sealed class OverlayRenderer : IDisposable
             var prefix = row.IsSelected ? "> " : (row.Target.IsEntity ? "* " : "  ");
             var text = prefix + row.Target.Name;
             var textBrush = row.IsSelected ? _bPlayer! : (row.Target.IsEntity ? _bLandmark! : _bText!);
-            rt.DrawText(text, _tf!, new Rect(left + NavPad + NavSwatch + 5f, y, left + panelW - 4f, y + NavRowH), textBrush, DrawTextOptions.Clip);
+            rt.DrawText(text, _tf!, Rect.FromLTRB(left + NavPad + NavSwatch + 5f, y, left + panelW - 4f, y + NavRowH), textBrush, DrawTextOptions.Clip);
             y += NavRowH;
         }
     }
@@ -1257,12 +1395,10 @@ public sealed class OverlayRenderer : IDisposable
 
     public void Dispose()
     {
-        _bPlayer?.Dispose(); _bOther?.Dispose(); _bText?.Dispose(); _bPanel?.Dispose(); _bLandmark?.Dispose();
-        _bPath?.Dispose(); _bStyle?.Dispose();
+        ReleaseDeviceResources();
         foreach (var geo in _geoCache.Values.Where(g => g is not null).Distinct()) geo!.Dispose();
         _geoCache.Clear();
-        _tf?.Dispose();
-        _terrain?.Dispose();
+        _tf?.Dispose(); _tf = null;
         _atlasIcons?.Dispose();
     }
 }

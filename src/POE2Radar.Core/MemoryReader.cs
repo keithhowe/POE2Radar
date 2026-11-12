@@ -90,12 +90,57 @@ public sealed class MemoryReader
         if (destination.IsEmpty) return 0;
         fixed (byte* p = destination)
         {
-            // Note: NtReadVirtualMemory only sets bytesRead reliably on success â€” on failure the value is
-            // implementation-defined. We return 0 for both "nothing read" and "partial read failed" cases.
-            // For our scan use case (small fixed chunks within a single region), all-or-nothing is fine.
+            // Returns the byte count the kernel reports, NOT all-or-nothing: 0 when nothing was readable,
+            // and a SHORT count when the range runs into an unreadable page (STATUS_PARTIAL_COPY — the
+            // leading bytes are valid). Callers must compare the result against the requested length.
             TryRead(address, p, (nuint)destination.Length, out var bytesRead);
             return (int)bytesRead;
         }
+    }
+
+    /// <summary>
+    /// Read up to <paramref name="size"/> bytes for a string window: the whole window if possible,
+    /// otherwise as many leading page-bounded pieces as are readable. A NUL-terminated string that sits
+    /// just before an unreadable page is still fully readable even though the fixed-size window is not.
+    /// Returns the number of leading bytes read (0 = nothing).
+    /// </summary>
+    private unsafe int ReadStringWindow(nint address, byte* buffer, int size)
+    {
+        if (TryRead(address, buffer, (nuint)size)) return size;
+        const int PageSize = 0x1000;
+        var done = 0;
+        while (done < size)
+        {
+            var at = address + done;
+            var piece = Math.Min(size - done, PageSize - (int)((ulong)at & (PageSize - 1)));
+            if (piece == size) break;   // window sits inside one page: that exact read just failed
+            if (!TryRead(at, buffer + done, (nuint)piece)) break;
+            done += piece;
+        }
+        return done;
+    }
+
+    /// <summary>
+    /// Read an MSVC <c>std::wstring</c> at <paramref name="address"/>: 16-byte inline buffer / heap
+    /// pointer at +0x00, length at +0x10, capacity at +0x18. Inline-vs-heap is decided by CAPACITY
+    /// (&gt;= 8 ⇒ heap), not length — a string that once held 8+ chars keeps its heap buffer after being
+    /// assigned something shorter. Returns empty on a failed read or a length outside
+    /// 1..<paramref name="maxChars"/>.
+    /// </summary>
+    public string ReadStdWString(nint address, int maxChars = 1024)
+    {
+        if (!TryReadStruct<int>(address + 0x10, out var len) || len <= 0 || len > maxChars) return string.Empty;
+        var heap = len >= 8;
+        // Trust the capacity only when it is plausible for a real wstring; otherwise keep the length rule.
+        if (!heap && TryReadStruct<long>(address + 0x18, out var cap) && cap >= 8 && cap <= 0x100000) heap = true;
+        if (heap && TryReadStruct<nint>(address, out var ptr) && (ulong)ptr >= 0x10000 && (ulong)ptr <= 0x7FFFFFFFFFFF)
+        {
+            var s = ReadStringUtf16(ptr, len);
+            if (s.Length > 0 || len >= 8) return s;
+            // Short string whose "capacity" was not really one: fall back to the inline buffer.
+        }
+        else if (len >= 8) return string.Empty;
+        return ReadStringUtf16(address, len);
     }
 
     /// <summary>Read a fixed-count array of blittable values into a freshly allocated array.</summary>
@@ -126,9 +171,8 @@ public sealed class MemoryReader
         Span<char> buf = maxChars <= 256 ? stackalloc char[maxChars] : new char[maxChars];
         fixed (char* p = buf)
         {
-            if (!TryRead(address, p, (nuint)(maxChars * sizeof(char)), out var bytesRead))
-                return string.Empty;
-            var charsRead = (int)(bytesRead / sizeof(char));
+            var charsRead = ReadStringWindow(address, (byte*)p, maxChars * sizeof(char)) / sizeof(char);
+            if (charsRead == 0) return string.Empty;
             var nullIdx = buf[..charsRead].IndexOf('\0');
             return new string(buf[..(nullIdx >= 0 ? nullIdx : charsRead)]);
         }
@@ -143,10 +187,10 @@ public sealed class MemoryReader
         Span<byte> buf = maxBytes <= 256 ? stackalloc byte[maxBytes] : new byte[maxBytes];
         fixed (byte* p = buf)
         {
-            if (!TryRead(address, p, (nuint)maxBytes, out var bytesRead))
-                return string.Empty;
-            var nullIdx = buf[..(int)bytesRead].IndexOf((byte)0);
-            return Encoding.UTF8.GetString(buf[..(nullIdx >= 0 ? nullIdx : (int)bytesRead)]);
+            var bytesRead = ReadStringWindow(address, p, maxBytes);
+            if (bytesRead == 0) return string.Empty;
+            var nullIdx = buf[..bytesRead].IndexOf((byte)0);
+            return Encoding.UTF8.GetString(buf[..(nullIdx >= 0 ? nullIdx : bytesRead)]);
         }
     }
 

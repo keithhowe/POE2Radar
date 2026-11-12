@@ -25,9 +25,11 @@ public sealed class BackgroundReplanner : IDisposable
         string TargetId, Poe2Live.TerrainData Terrain, (int x, int y) Start, (int x, int y) Goal);
 
     /// <summary>A finished route: the smoothed waypoints for <paramref name="TargetId"/> toward
-    /// <paramref name="Goal"/>.</summary>
+    /// <paramref name="Goal"/>. <paramref name="Terrain"/> is the grid it was planned on — target ids are
+    /// only unique per area (entity ids recur), so the consumer must drop a result whose terrain is no
+    /// longer the current one instead of applying an old zone's route to a same-named target.</summary>
     public readonly record struct Result(
-        string TargetId, (float x, float y) Goal, IReadOnlyList<(int x, int y)> Waypoints);
+        string TargetId, Poe2Live.TerrainData Terrain, (float x, float y) Goal, IReadOnlyList<(int x, int y)> Waypoints);
 
     // Only the worker thread ever touches this planner → its A* buffers are never used concurrently.
     private readonly PathPlanner _planner = new();
@@ -99,14 +101,14 @@ public sealed class BackgroundReplanner : IDisposable
                 try
                 {
                     var waypoints = _planner.Plan(req.Terrain, req.Start, req.Goal);
-                    _results.Enqueue(new Result(req.TargetId, (req.Goal.x, req.Goal.y), waypoints));
+                    _results.Enqueue(new Result(req.TargetId, req.Terrain, (req.Goal.x, req.Goal.y), waypoints));
                 }
                 catch (Exception ex)
                 {
                     // Never let a planning failure kill the worker; surface an empty route so the
                     // tracker clears its in-flight flag.
                     Console.Error.WriteLine($"Replan failed for {req.TargetId}: {ex.Message}");
-                    _results.Enqueue(new Result(req.TargetId, (req.Goal.x, req.Goal.y),
+                    _results.Enqueue(new Result(req.TargetId, req.Terrain, (req.Goal.x, req.Goal.y),
                         Array.Empty<(int, int)>()));
                 }
             }

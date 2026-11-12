@@ -230,13 +230,8 @@ public sealed class Poe2Runeforge
         => Children(el, out var first, out var n) && index >= 0 && index < n
             ? Ptr(first + (nint)(index * 8)) : 0;
 
-    private string ReadStdWString(nint addr)
-    {
-        if (!_reader.TryReadStruct<int>(addr + 0x10, out var len) || len <= 0 || len > 1024) return "";
-        if (len < 8) return _reader.ReadStringUtf16(addr, len);
-        var ptr = Ptr(addr);
-        return ptr == 0 ? "" : _reader.ReadStringUtf16(ptr, len);
-    }
+    // Inline-vs-heap is decided by the wstring's CAPACITY, not its length — see MemoryReader.ReadStdWString.
+    private string ReadStdWString(nint addr) => _reader.ReadStdWString(addr, 1024);
 
     private nint Ptr(nint addr)
     {

@@ -14,9 +14,12 @@ namespace POE2Radar.Overlay;
 /// <see cref="ID2D1Bitmap"/> per icon on first draw, cached for the renderer's lifetime. Used by
 /// <see cref="OverlayRenderer"/> to stamp content icons above tracked / fogged atlas nodes (#5).
 ///
-/// <para>The overlay's render target is a stable <c>ID2D1DCRenderTarget</c> (it binds a DC per frame
-/// rather than living on a swapchain), so bitmaps created from it stay valid across window resizes —
-/// no device-loss recreation dance needed, same as <see cref="TerrainBitmap"/>.</para>
+/// <para>The overlay's render target is an <c>ID2D1DCRenderTarget</c> re-bound to a new DC on resize, so
+/// bitmaps created from it stay valid across window resizes. They do NOT survive device loss
+/// (<c>EndDraw</c> → D2DERR_RECREATE_TARGET: GPU driver reset, adapter change, RDP switch): the bitmaps
+/// belong to the lost target, so <see cref="OverlayRenderer"/> calls <see cref="ReleaseDeviceResources"/>
+/// when it recreates the target and they are re-materialized from the decoded pixels (which are
+/// device-independent and kept) on next use. Same lifetime rule as <see cref="TerrainBitmap"/>.</para>
 /// </summary>
 public sealed class AtlasIconCache : IDisposable
 {
@@ -97,9 +100,14 @@ public sealed class AtlasIconCache : IDisposable
         return bmp;
     }
 
-    public void Dispose()
+    /// <summary>Drop every materialized D2D bitmap (and the negative cache, which may hold failures from
+    /// the lost device) while keeping the decoded pixels, so <see cref="Get"/> rebuilds each icon on the
+    /// new render target. Call when the render target is recreated after device loss.</summary>
+    public void ReleaseDeviceResources()
     {
         foreach (var b in _bitmaps.Values) b?.Dispose();
         _bitmaps.Clear();
     }
+
+    public void Dispose() => ReleaseDeviceResources();
 }
