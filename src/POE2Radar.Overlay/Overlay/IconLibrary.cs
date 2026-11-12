@@ -17,7 +17,9 @@ public sealed record IconDef(string Name, float VbX, float VbY, float VbW, float
 /// — the same convention <see cref="Config.RadarSettings"/> uses for <c>config/</c>. Any <c>*.svg</c>
 /// file in that folder is loaded too; a file whose name matches a built-in overrides it, so users can
 /// restyle existing icons or add brand-new ones by dropping in standard single-or-multi-<c>&lt;path&gt;</c>
-/// SVGs. Lookups are case-insensitive. Loaded once on first access.
+/// SVGs. A materialized built-in the user has NOT edited is not an override: it is tracked in a small
+/// manifest and refreshed when the built-in changes in a newer build (see <see cref="SyncBuiltIns"/>).
+/// Lookups are case-insensitive. Loaded once on first access.
 /// </summary>
 public static class IconLibrary
 {
@@ -40,29 +42,125 @@ public static class IconLibrary
     public static string? Canonical(string? name)
         => !string.IsNullOrEmpty(name) && Map.TryGetValue(name, out var d) ? d.Name : null;
 
+    /// <summary>Record of what the app itself wrote into <see cref="Directory"/>: one
+    /// "<c>name&lt;TAB&gt;sha256-of-file-content</c>" line per materialized built-in. It is what tells a
+    /// built-in file the user never touched (content still hashes to the recorded value) from one they
+    /// edited — only the latter is a user override.</summary>
+    private static string ManifestPath => Path.Combine(Directory, "builtin-icons.manifest");
+
+    private static string Hash(string content)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(content)));
+
+    private static Dictionary<string, string> ReadManifest()
+    {
+        var m = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (!File.Exists(ManifestPath)) return m;
+            foreach (var line in File.ReadAllLines(ManifestPath))
+            {
+                if (line.Length == 0 || line[0] == '#') continue;
+                var tab = line.IndexOf('\t');
+                if (tab <= 0 || tab == line.Length - 1) continue;
+                m[line[..tab]] = line[(tab + 1)..].Trim();
+            }
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"Icon manifest read failed: {ex.Message}"); }
+        return m;
+    }
+
+    private static void WriteManifest(Dictionary<string, string> manifest)
+    {
+        var sb = new StringBuilder();
+        sb.Append("# POE2Radar built-in icon manifest (name<TAB>sha256 of the file as the app wrote it). Do not edit:\n");
+        sb.Append("# a built-in .svg whose content still matches is kept up to date with the app; edit the .svg\n");
+        sb.Append("# itself (or drop in your own) and it becomes YOUR override, which always wins.\n");
+        foreach (var kv in manifest.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+            sb.Append(kv.Key).Append('\t').Append(kv.Value).Append('\n');
+        File.WriteAllText(ManifestPath, sb.ToString());
+    }
+
+    /// <summary>
+    /// Bring the on-disk copies of the built-ins in line with this build and return the names of the
+    /// built-ins whose file is UNTOUCHED (so the in-code definition is authoritative for them). A built-in
+    /// file is a user override only if its content differs from what the app materialized:
+    /// <list type="bullet">
+    /// <item>missing and never materialized (first run, or a built-in new in this build) → written;</item>
+    /// <item>content == the hash recorded when the app wrote it → untouched; rewritten if the built-in
+    /// has changed since, so a newer built-in is never shadowed by its own stale copy;</item>
+    /// <item>no record (install from before the manifest existed) and identical to the current built-in
+    /// → untouched, recorded;</item>
+    /// <item>anything else (edited, or user-dropped under a built-in's name) → left alone; it overrides.</item>
+    /// </list>
+    /// A built-in file the user DELETED stays deleted (the built-in itself still loads from code).
+    /// </summary>
+    private static HashSet<string> SyncBuiltIns(List<IconDef> builtins)
+    {
+        var untouched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            System.IO.Directory.CreateDirectory(Directory); // no-op when it exists
+            var manifest = ReadManifest();
+            var changed = false;
+            foreach (var b in builtins)
+            {
+                try
+                {
+                    var file = Path.Combine(Directory, b.Name + ".svg");
+                    var current = ToSvg(b);
+                    var currentHash = Hash(current);
+                    var recorded = manifest.TryGetValue(b.Name, out var h) ? h : null;
+
+                    if (!File.Exists(file))
+                    {
+                        if (recorded is not null) continue;          // we wrote it once; the user removed it
+                        File.WriteAllText(file, current);
+                        manifest[b.Name] = currentHash; changed = true;
+                        untouched.Add(b.Name);
+                        continue;
+                    }
+
+                    var diskHash = Hash(File.ReadAllText(file));
+                    if (diskHash == currentHash)
+                    {
+                        // Identical to this build's built-in (also the no-manifest legacy case).
+                        if (recorded != currentHash) { manifest[b.Name] = currentHash; changed = true; }
+                        untouched.Add(b.Name);
+                    }
+                    else if (recorded is not null && string.Equals(diskHash, recorded, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Exactly what an older build wrote, never edited → refresh to the new built-in.
+                        File.WriteAllText(file, current);
+                        manifest[b.Name] = currentHash; changed = true;
+                        untouched.Add(b.Name);
+                    }
+                    // else: differs from both → the user's own version; it overrides the built-in.
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"Icon '{b.Name}' materialize failed: {ex.Message}"); }
+            }
+            if (changed) WriteManifest(manifest);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"Icon library materialize failed: {ex.Message}"); }
+        return untouched;
+    }
+
     private static (IReadOnlyList<IconDef>, IReadOnlyDictionary<string, IconDef>) Load()
     {
         var builtins = BuiltIns();
 
-        // First run: materialize built-ins to disk so they're discoverable/editable (like config/).
-        try
-        {
-            if (!System.IO.Directory.Exists(Directory))
-            {
-                System.IO.Directory.CreateDirectory(Directory);
-                foreach (var b in builtins)
-                    File.WriteAllText(Path.Combine(Directory, b.Name + ".svg"), ToSvg(b));
-            }
-        }
-        catch (Exception ex) { Console.Error.WriteLine($"Icon library materialize failed: {ex.Message}"); }
+        // Materialize / refresh the built-ins on disk so they're discoverable/editable (like config/), and
+        // learn which of those files are still the app's own copy rather than a user override.
+        var untouched = SyncBuiltIns(builtins);
 
-        // Load any on-disk svgs (these override built-ins of the same name and add new ones).
+        // Load any on-disk svgs (these override built-ins of the same name and add new ones). A built-in's
+        // untouched materialized copy is NOT an override — skip it so the in-code definition is used.
         var disk = new Dictionary<string, IconDef>(StringComparer.OrdinalIgnoreCase);
         try
         {
             if (System.IO.Directory.Exists(Directory))
                 foreach (var path in System.IO.Directory.EnumerateFiles(Directory, "*.svg"))
                 {
+                    if (untouched.Contains(Path.GetFileNameWithoutExtension(path))) continue;
                     var def = TryParseSvgFile(path);
                     if (def is not null) disk[def.Name] = def;
                 }

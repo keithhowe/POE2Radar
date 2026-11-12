@@ -133,30 +133,44 @@ public sealed class ItemModTranslator
             if (i >= conds.Length) continue;
             var c = conds[i];
             if (c == null) continue;
-            if (c.Min.HasValue && vals[i] < c.Min.Value) return false;
-            if (c.Max.HasValue && vals[i] > c.Max.Value) return false;
+            var inRange = (!c.Min.HasValue || vals[i] >= c.Min.Value) && (!c.Max.HasValue || vals[i] <= c.Max.Value);
+            // "negated" inverts the range test: {min:0,max:0,negated:true} means "value != 0".
+            if (inRange == c.Negated) return false;
         }
         return true;
     }
 
+    private static double Round(double v, int dp) => Math.Round(v, dp, MidpointRounding.AwayFromZero);
+
     private static double ApplyHandler(double v, string h) => h switch
     {
         "negate" => -v,
+        "double" => v * 2.0,
+        "negate_and_double" => -v * 2.0,
+        "subtract_one" => v - 1.0,
         "divide_by_one_hundred_and_negate" => -v / 100.0,
         "divide_by_one_hundred" => v / 100.0,
         "divide_by_one_hundred_2dp" or "divide_by_one_hundred_2dp_if_required" => v / 100.0,
         "divide_by_two" => v / 2.0,
+        "divide_by_two_0dp" => Round(v / 2.0, 0),
         "divide_by_three" => v / 3.0,
         "divide_by_four" => v / 4.0,
         "divide_by_five" => v / 5.0,
         "divide_by_ten" => v / 10.0,
+        "divide_by_ten_0dp" => Round(v / 10.0, 0),
+        "divide_by_ten_1dp" or "divide_by_ten_1dp_if_required" => Round(v / 10.0, 1),
         "divide_by_twenty" => v / 20.0,
         "divide_by_fifty" => v / 50.0,
         "divide_by_one_thousand" => v / 1000.0,
         "milliseconds_to_seconds" => v / 1000.0,
-        "milliseconds_to_seconds_1dp" or "milliseconds_to_seconds_2dp" => v / 1000.0,
+        "milliseconds_to_seconds_0dp" => Round(v / 1000.0, 0),
+        "milliseconds_to_seconds_1dp" => Round(v / 1000.0, 1),
+        "milliseconds_to_seconds_2dp" or "milliseconds_to_seconds_2dp_if_required" => v / 1000.0,
         "deciseconds_to_seconds" => v / 10.0,
-        "per_minute_to_per_second" or "per_minute_to_per_second_1dp" or "per_minute_to_per_second_2dp" => v / 60.0,
+        "per_minute_to_per_second" => v / 60.0,
+        "per_minute_to_per_second_0dp" => Round(v / 60.0, 0),
+        "per_minute_to_per_second_1dp" => Round(v / 60.0, 1),
+        "per_minute_to_per_second_2dp" or "per_minute_to_per_second_2dp_if_required" => v / 60.0,
         "times_twenty" => v * 20.0,
         "times_one_point_five" => v * 1.5,
         "multiplicative_damage_modifier" or "multiplicative_permyriad_damage_modifier" => v,
@@ -237,5 +251,6 @@ public sealed class ItemModTranslator
     {
         [JsonPropertyName("min")] public int? Min { get; set; }
         [JsonPropertyName("max")] public int? Max { get; set; }
+        [JsonPropertyName("negated")] public bool Negated { get; set; }
     }
 }

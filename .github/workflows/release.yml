@@ -7,7 +7,7 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}   # allow manual runs from the Actions tab
+  workflow_dispatch: {}   # manual re-run from the Actions tab — pick a v* TAG under "Use workflow from"
 
 permissions:
   contents: write          # needed to create the Release
@@ -16,6 +16,19 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
+      # The version baked into the exe, the zip name and the Release are all derived from the tag name, so
+      # a manual run started from a branch (ref_name = "main") could only fail obscurely or ship something
+      # mislabelled. Refuse it up front. Skipped entirely on the normal tag-push path.
+      - name: Require a version tag
+        if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          Write-Host "::error::Releases are built from a v* tag, but this run is on $env:REF_TYPE '$env:REF_NAME'. Re-run the workflow and select the tag under 'Use workflow from' (or push the tag)."
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4

@@ -27,10 +27,14 @@ public sealed class HiddenEntities
     public HiddenEntities(string filePath)
     {
         _filePath = filePath;
+        // Seed the default ONLY on a true first run (no file yet). An existing file that holds an empty
+        // list is the user's choice ("nothing hidden") and must survive a restart — re-seeding whenever
+        // the list was empty made it impossible to keep it empty.
+        var firstRun = !File.Exists(_filePath);
         Load();
-        if (_patterns.Count == 0) _patterns.Add("AbyssCrack"); // sensible default (persisted on first Save)
+        if (firstRun) _patterns.Add("AbyssCrack"); // sensible default, persisted below
         Rebuild();
-        Save();
+        if (firstRun) Save();
     }
 
     /// <summary>Current patterns (snapshot copy; safe to enumerate off-thread).</summary>
@@ -113,9 +117,7 @@ public sealed class HiddenEntities
     {
         try
         {
-            var dir = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(_filePath, JsonSerializer.Serialize(_patterns.ToList(), Json));
+            Config.AtomicFile.WriteAllText(_filePath, JsonSerializer.Serialize(_patterns.ToList(), Json));
         }
         catch (Exception ex) { Console.Error.WriteLine($"Hidden entities save failed: {ex.Message}"); }
     }

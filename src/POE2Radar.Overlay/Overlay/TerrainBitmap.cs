@@ -100,7 +100,9 @@ public sealed class TerrainBitmap : IDisposable
             }
         }
 
+        // Null it too: if CreateBitmap below throws (device lost), Bitmap must not hand out a disposed object.
         _bitmap?.Dispose();
+        _bitmap = null;
         var props = new BitmapProperties(new PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied));
         // Premultiply alpha so D2D blends correctly.
         for (var i = 0; i < pixels.Length; i += 4)

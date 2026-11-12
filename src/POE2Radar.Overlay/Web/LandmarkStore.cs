@@ -111,9 +111,31 @@ public sealed class LandmarkStore
     {
         lock (_gate)
         {
-            _user = data ?? new(StringComparer.OrdinalIgnoreCase);
+            _user = Normalize(data);
             Rebuild(); Save();
         }
+    }
+
+    /// <summary>
+    /// Copy a deserialized area → pattern → label map into the shape the store relies on: a
+    /// CASE-INSENSITIVE area dictionary (areas that differ only by case are merged, later entries
+    /// winning — so the saved file can never hold two such keys and fail the next load), with null area
+    /// maps (a JSON <c>"area": null</c>) and blank area/pattern keys dropped, and a blank label treated
+    /// as "suppress" (null), exactly like <see cref="Set"/> via the API.
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, string?>> Normalize(Dictionary<string, Dictionary<string, string?>>? data)
+    {
+        var res = new Dictionary<string, Dictionary<string, string?>>(StringComparer.OrdinalIgnoreCase);
+        if (data == null) return res;
+        foreach (var (area, map) in data)
+        {
+            if (string.IsNullOrWhiteSpace(area) || map is null) continue;
+            var key = area.Trim();
+            if (!res.TryGetValue(key, out var m)) { m = new(StringComparer.Ordinal); res[key] = m; }
+            foreach (var (pat, label) in map)
+                if (!string.IsNullOrWhiteSpace(pat)) m[pat.Trim()] = string.IsNullOrWhiteSpace(label) ? null : label.Trim();
+        }
+        return res;
     }
 
     /// <summary>Export the EFFECTIVE merged table (baked overlaid by user edits, suppressed entries
@@ -149,7 +171,9 @@ public sealed class LandmarkStore
         {
             if (!File.Exists(_filePath)) return;
             var data = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string?>>>(File.ReadAllText(_filePath), Json);
-            if (data != null) _user = new Dictionary<string, Dictionary<string, string?>>(data, StringComparer.OrdinalIgnoreCase);
+            // Normalize rather than wrap: the copy-constructor throws on keys that differ only by case
+            // (which discarded the whole overlay), and a null area map would break every later read.
+            if (data != null) _user = Normalize(data);
         }
         catch (Exception ex) { Console.Error.WriteLine($"Landmark store load failed: {ex.Message}"); }
     }
@@ -158,9 +182,7 @@ public sealed class LandmarkStore
     {
         try
         {
-            var dir = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(_filePath, JsonSerializer.Serialize(_user, Json));
+            Config.AtomicFile.WriteAllText(_filePath, JsonSerializer.Serialize(_user, Json));
         }
         catch (Exception ex) { Console.Error.WriteLine($"Landmark store save failed: {ex.Message}"); }
     }

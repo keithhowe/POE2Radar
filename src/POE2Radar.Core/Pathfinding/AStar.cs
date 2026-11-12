@@ -103,6 +103,9 @@ public sealed class AStar
 
                 var cellValue = pf.Read(nx, ny);
                 if (cellValue == 0) continue;
+                // A diagonal step must not squeeze between two blocked orthogonal cells — that is a
+                // closed corner (a one-cell-thick diagonal wall), not a walkable gap.
+                if (dx != 0 && dy != 0 && pf.Read(cx + dx, cy) == 0 && pf.Read(cx, cy + dy) == 0) continue;
 
                 var stepCost  = flatCost ? baseCost : baseCost * (6 - cellValue);
                 var tentative = currentG + stepCost;

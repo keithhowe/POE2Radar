@@ -647,7 +647,11 @@ public sealed class RadarApp : IDisposable
                 if (_gameHwnd == 0) _gameHwnd = OverlayNative.FindWindowForProcess(_process.ProcessId);
                 if (_gameHwnd != 0) _window.TrackGameWindow(_gameHwnd);
                 if (!_window.PumpMessages()) break;
-                Tick();
+                // A render-frame failure (bad read mid zone-load, a draw-call exception) must not take the
+                // whole overlay down — same policy as WorldLoop. Logged rate-limited so a persistent fault
+                // is visible without flooding the console at frame rate.
+                try { Tick(); }
+                catch (Exception ex) { LogThrottled(ref _nextRenderErrLogUtc, $"Render tick error: {ex.GetType().Name}: {ex.Message}"); }
 
                 // Effective render FPS over a rolling ~500 ms window (actual loop iterations/sec, after
                 // pacing) — exposed via /state so we can verify we're truly hitting FpsCap, not just asking.
@@ -710,10 +714,33 @@ public sealed class RadarApp : IDisposable
                 else
                     PublishEmptyWorld();
             }
-            catch (Exception ex) { Console.Error.WriteLine($"World tick error: {ex.Message}"); }
+            catch (Exception ex) { LogThrottled(ref _nextWorldErrLogUtc, $"World tick error: {ex.GetType().Name}: {ex.Message}"); }
             _worldMs = (float)sw.Elapsed.TotalMilliseconds;
             Thread.Sleep(Math.Max(1, budgetMs - (int)sw.ElapsedMilliseconds));
         }
+    }
+
+    private DateTime _nextRenderErrLogUtc = DateTime.MinValue;   // render thread
+    private DateTime _nextWorldErrLogUtc = DateTime.MinValue;    // world thread
+    private DateTime _nextFeatureErrLogUtc = DateTime.MinValue;  // world thread
+
+    /// <summary>Write an error line at most once per second per call site (each site owns its own gate, on
+    /// its own thread) — a fault that recurs every tick stays visible without flooding the console.</summary>
+    private static void LogThrottled(ref DateTime nextUtc, string message)
+    {
+        var now = DateTime.UtcNow;
+        if (now < nextUtc) return;
+        nextUtc = now.AddSeconds(1);
+        Console.Error.WriteLine(message);
+    }
+
+    /// <summary>Run one OPTIONAL world-tick feature (atlas, price panels, monoliths…) so that a failure in
+    /// it cannot abort the tick before the core world snapshot is published — otherwise one bad read in a
+    /// side panel freezes the whole radar for as long as it keeps failing.</summary>
+    private void RunFeature(string name, Action update)
+    {
+        try { update(); }
+        catch (Exception ex) { LogThrottled(ref _nextFeatureErrLogUtc, $"World feature '{name}' error: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     /// <summary>Not in game: publish an empty world snapshot + closed atlas so the render thread draws no
@@ -729,6 +756,8 @@ public sealed class RadarApp : IDisposable
         if (!ReferenceEquals(_runeRender, RuneRender.Closed)) _runeRender = RuneRender.Closed;
         if (!ReferenceEquals(_exchangeRender, ExchangeRender.Closed)) _exchangeRender = ExchangeRender.Closed;
         if (!ReferenceEquals(_lootTags, LootTagRender.Empty)) _lootTags = LootTagRender.Empty;
+        if (!ReferenceEquals(_ritualRender, RitualRender.Closed)) _ritualRender = RitualRender.Closed;
+        if (_hoverPrice != null) _hoverPrice = null;
     }
 
     /// <summary>Read the open "Runeshape Combinations" panel (cheap when closed) and publish a priced label
@@ -1439,28 +1468,30 @@ public sealed class RadarApp : IDisposable
         // Atlas F10 route — ReadNodes is cheap when the atlas is closed (it gates on the atlas
         // panel's visible bit before any whole-tree scan), so this is safe each world tick. Publishes
         // its own _atlasRender bundle.
-        UpdateAtlas(inGameState);
+        // Each of these side features is isolated (RunFeature): a throw in one must not abort the tick
+        // before the world snapshot below is published.
+        RunFeature("atlas", () => UpdateAtlas(inGameState));
 
         // Rune-crafting reward prices — cheap when the panel is closed (the fingerprint walk bails at the
         // visible-gate step). Publishes its own _runeRender bundle.
-        UpdateRuneforge(inGameState);
-        UpdateRitualRewards(inGameState);
+        RunFeature("runeforge", () => UpdateRuneforge(inGameState));
+        RunFeature("ritual", () => UpdateRitualRewards(inGameState));
 
         // Currency Exchange (Kalguur market) order book — cheap when the panel is closed (the reader returns
         // Book.Closed without resolving). Publishes its own _exchangeRender bundle.
-        UpdateCurrencyExchange(inGameState);
+        RunFeature("exchange", () => UpdateCurrencyExchange(inGameState));
 
         // Loot-tag value chips — throttled, invisible-subtree-pruned UI scan; matches tag text → price.
         // Publishes its own _lootTags bundle (render thread re-reads each tag's live rect).
-        UpdateLootTags(inGameState);
+        RunFeature("loot tags", () => UpdateLootTags(inGameState));
 
         // Hover price — the item under the cursor in an item UI (inventory/stash/vendor), priced + published
         // as a spec the render thread anchors beside the game tooltip (its rect re-read live).
-        UpdateHoverPrice(inGameState);
+        RunFeature("hover price", () => UpdateHoverPrice(inGameState));
 
         // Runeshape monolith rewards — resolve each in-world monolith device + price its offered rewards
         // (area-wide, before the panel is opened). Publishes its own _monoRender bundle.
-        UpdateMonoliths(areaInstance, areaLevel, areaHash);
+        RunFeature("monoliths", () => UpdateMonoliths(areaInstance, areaLevel, areaHash));
 
 
         // Rebuild the unified navigation-target list (tiles + entity POIs) for this tick.
@@ -1734,7 +1765,10 @@ public sealed class RadarApp : IDisposable
         // No plausible vitals read (Life component missing, or vital offsets drifted past the auto-
         // relocation's reach): DON'T fire — firing on unknown HP would either spam or never trigger.
         // Surface it so a post-patch break is visible instead of silently "armed but never fires".
-        if (_live.PlayerVitals(localPlayer) is not { } v)
+        // RENDER reader stack: this runs on the render thread, so it must never touch the world thread's
+        // _live (its Life-component cache is not thread-safe). Reading through _liveRender also self-heals
+        // THIS stack's Health offset, which the per-frame HP-bar reads (TryLiveBarAt) depend on.
+        if (_liveRender.PlayerVitals(localPlayer) is not { } v)
         {
             _flaskNote = "paused (vitals unreadable — offsets may have drifted)";
             return;
@@ -1742,7 +1776,9 @@ public sealed class RadarApp : IDisposable
         _hpPct = v.HpPct; _manaPct = v.ManaPct; _esPct = v.EsPct;
 
         if (!_autoFlask) { _flaskNote = "OFF (F8)"; return; }
-        if (GetForegroundWindow() != _gameHwnd) { _flaskNote = "paused (PoE2 not focused)"; return; }
+        // _gameHwnd == 0 (window not found yet) must never pass the gate: GetForegroundWindow() can itself
+        // return NULL during a focus transition, which would otherwise compare equal.
+        if (_gameHwnd == 0 || GetForegroundWindow() != _gameHwnd) { _flaskNote = "paused (PoE2 not focused)"; return; }
         _flaskNote = "armed";
 
         // Which pool(s) the single life-flask key watches. ES only participates when a real ES pool is
@@ -1759,12 +1795,16 @@ public sealed class RadarApp : IDisposable
         var now = DateTime.UtcNow;
         if (lifeTrigger && now - _lifeFiredAt >= TimeSpan.FromMilliseconds(_settings.LifeCooldownMs))
         {
-            SendInputNative.Tap((ushort)_settings.LifeKey); _lifeFiredAt = now; _flaskNote = lifeReason;
+            // Stamp the cooldown either way (a blocked/unmappable key must not retry every frame), but say
+            // so when the keystroke was NOT delivered instead of claiming the flask fired.
+            var sent = SendInputNative.Tap((ushort)_settings.LifeKey);
+            _lifeFiredAt = now; _flaskNote = sent ? lifeReason : "life key NOT sent (input blocked / unmapped key)";
         }
         if (v.ManaPct < _settings.ManaThresholdPct &&
             now - _manaFiredAt >= TimeSpan.FromMilliseconds(_settings.ManaCooldownMs))
         {
-            SendInputNative.Tap((ushort)_settings.ManaKey); _manaFiredAt = now; _flaskNote = $"mana@{v.ManaPct:F0}%";
+            var sent = SendInputNative.Tap((ushort)_settings.ManaKey);
+            _manaFiredAt = now; _flaskNote = sent ? $"mana@{v.ManaPct:F0}%" : "mana key NOT sent (input blocked / unmapped key)";
         }
     }
 
@@ -1772,6 +1812,12 @@ public sealed class RadarApp : IDisposable
     /// Map calibration is web-config-only (no in-game keys, to avoid accidental presses).</summary>
     private void HandleHotkeys()
     {
+        // GetAsyncKeyState is system-wide, so every hotkey is gated on PoE2 being the foreground window —
+        // otherwise F9 in another app would quit the overlay, F8 would flip auto-flask, and F10/F11 (debugger
+        // step keys, browser fullscreen) would mutate the atlas route while you're working elsewhere.
+        // Quit without game focus via the tray icon or Ctrl+C in the console.
+        if (_gameHwnd == 0 || GetForegroundWindow() != _gameHwnd) return;
+
         // F8 master kill-switch for auto-flask (debounced).
         if (Down(0x77) && DateTime.UtcNow >= _nextToggleAt)
         {
@@ -1797,10 +1843,9 @@ public sealed class RadarApp : IDisposable
         // F9 quits the overlay (besides the tray-icon Exit).
         if (Down(0x78)) { Console.WriteLine("\nF9 — exiting."); RequestShutdown(); }
 
-        // F12 opens the web dashboard in the default browser — only while PoE2 is the foreground
-        // window (debounced). Purely launches a browser; sends nothing to the game.
-        if (Down(0x7B) && DateTime.UtcNow >= _nextBrowserAt
-            && _gameHwnd != 0 && GetForegroundWindow() == _gameHwnd)
+        // F12 opens the web dashboard in the default browser (debounced; foreground-gated above).
+        // Purely launches a browser; sends nothing to the game.
+        if (Down(0x7B) && DateTime.UtcNow >= _nextBrowserAt)
         {
             _nextBrowserAt = DateTime.UtcNow.AddMilliseconds(800);
             OpenDashboard();
@@ -1838,7 +1883,11 @@ public sealed class RadarApp : IDisposable
     /// tooltip — that interfered with the point-to-point selection; the pick is just echoed to the console.)</summary>
     private void AtlasRoutePick()
     {
-        if (_inGameStateForApi == 0 || !GetCursorPos(out var pt)) { Console.WriteLine("\n[atlas route] not in game."); return; }
+        if (_inGameStateForApi == 0 || !OverlayNative.GetCursorPos(out var screenPt)) { Console.WriteLine("\n[atlas route] not in game."); return; }
+        // The projection is in overlay-CLIENT pixels (the overlay sits on the game's client area), so the
+        // cursor must be converted from screen space first — otherwise the pick is offset by the window
+        // origin whenever the game isn't at screen (0,0) (windowed, or on a second monitor).
+        var pt = ScreenToClientPoint(screenPt);
         // Invert the shared projection: for screen = relPos × scale (offset/shear/persp = 0), relPos = screen/scale.
         var proj = AtlasProjection();
         double scaleX = Math.Abs(proj[0]) > 1e-6 ? proj[0] : 1, scaleY = Math.Abs(proj[4]) > 1e-6 ? proj[4] : 1;
@@ -1959,8 +2008,9 @@ public sealed class RadarApp : IDisposable
 
     /// <summary>Zone change: remember the leaving zone's selection (by its instance hash), then either
     /// RESTORE the selection we previously had for the zone we're entering (so a town round-trip keeps
-    /// your pathing) or — on a first visit — seed it from the persistent auto-nav patterns. Trackers are
-    /// NOT touched here — the per-tick reconciliation (ReconcileTrackers) syncs them to _selectedIds.</summary>
+    /// your pathing) or — on a first visit — seed it from the persistent auto-nav patterns. The old
+    /// zone's trackers are dropped here; the per-tick reconciliation (ReconcileTrackers) recreates them
+    /// from _selectedIds.</summary>
     private void OnAreaChanged(uint areaHash)
     {
         int count; bool restored;
@@ -1999,6 +2049,11 @@ public sealed class RadarApp : IDisposable
             count = _selectedIds.Count;
         }
         _selectedPaths = new List<SelectedPath>();
+        // Target ids are only unique PER AREA ("e:<entityId>" recurs across instances), so a tracker that
+        // survived the zone change would keep drawing the old zone's waypoints for a same-id target until
+        // its next replan landed. Drop them all; MaintainRoutes (later this tick) recreates one per
+        // selected id and plans it on the new terrain. World thread — the tracker map's only owner.
+        _trackers.Clear();
 
         if (count > 0)
             Console.WriteLine($"\nNav: {(restored ? "restored" : "auto-selected")} {count} target(s) on zone change.");
@@ -2234,6 +2289,7 @@ public sealed class RadarApp : IDisposable
         {
             foreach (var r in results)
             {
+                if (!ReferenceEquals(r.Terrain, _terrain)) continue;               // planned on a previous zone's grid → stale
                 if (!_trackers.TryGetValue(r.TargetId, out var tracker)) continue; // deselected → ignore
                 tracker.ApplyResult(r.Waypoints, new NumVec2(r.Goal.x, r.Goal.y));
             }
@@ -2378,12 +2434,11 @@ public sealed class RadarApp : IDisposable
     private object AtlasJson()
     {
         // Anchor the scan to the live game-heap slab (the catalog shares the arena with AreaInstance).
-        var d = _atlas.Read(_lastAreaInstance);
+        var d = _atlas.Read(_areaInstanceForApi);
         // Live node graph (atlas nodes are UiElements) — summary + the locally-visible highlight set.
         var nodes = _inGameStateForApi != 0 ? _atlas.ReadNodes(_inGameStateForApi) : new List<Poe2Atlas.AtlasNodeLive>();
         var vis = nodes.Where(n => n.Visible).ToList();
-        (int X, int Y)? rGoal, rStart; lock (_atlasLock) { rGoal = _atlasGoalGrid; rStart = _atlasStartGrid; }
-        rStart ??= _atlasRouteStartResolved;
+        (int X, int Y)? rGoal, rStart; lock (_atlasLock) { rGoal = _atlasGoalGrid; rStart = _atlasStartGrid ?? _atlasRouteStartResolved; }
         // Hop distance from "where you are" to EVERY node, for the dashboard's distance-sorted list: one
         // multi-source BFS seeded from the current node (when the marker resolves) or the runnable frontier.
         var hopsByGrid = new Dictionary<(int, int), int>();
@@ -2441,6 +2496,7 @@ public sealed class RadarApp : IDisposable
             // The currently active rules (persisted): tracked tags (rings) + arrow tags (off-screen
             // direction). Match against BOTH content tags and map names.
             highlightTags = _settings.AtlasHighlightTags,
+            highlightColors = _settings.AtlasHighlightColors,   // tag → "#RRGGBB" (lets the dashboard re-post rules without losing colours)
             navTags = _settings.AtlasNavTags,
             arrowTags = _settings.AtlasArrowTags,
             // Route-pipeline diagnostics (post-patch triage): what the world thread last PUBLISHED for the
@@ -2528,18 +2584,27 @@ public sealed class RadarApp : IDisposable
             // ADDITIVE: add each built-in target name to the rule lists if not already present, never
             // clearing the user's own rules. Seeds once (the AtlasTargetsSeeded guard), independent of the
             // legacy AtlasRulesInitialized so it also reaches configs from before this preset existed.
-            _settings.AtlasHighlightTags ??= new List<string>();
-            _settings.AtlasNavTags ??= new List<string>();
-            _settings.AtlasArrowTags ??= new List<string>();
+            // COPY-ON-WRITE: these collections are read concurrently by the API thread (serialized for
+            // /api/settings + /api/atlas, and by Save()), so never mutate the live instances in place —
+            // build fresh ones and swap the references.
+            var hl = new List<string>(_settings.AtlasHighlightTags ?? new());
+            var nav = new List<string>(_settings.AtlasNavTags ?? new());
+            var arrows = new List<string>(_settings.AtlasArrowTags ?? new());
+            var colors = new Dictionary<string, string>(
+                _settings.AtlasHighlightColors ?? new(), StringComparer.OrdinalIgnoreCase);
             void AddOnce(List<string> list, string name) { if (!list.Contains(name)) list.Add(name); }
             foreach (var (code, color, on) in BuiltInAtlasTargets)
             {
                 if (!on || !byCode.TryGetValue(code, out var name)) continue;
-                AddOnce(_settings.AtlasHighlightTags, name); // ring
-                AddOnce(_settings.AtlasNavTags, name);       // + auto-route
-                AddOnce(_settings.AtlasArrowTags, name);     // + off-screen arrow
-                _settings.AtlasHighlightColors[name] = color;
+                AddOnce(hl, name);       // ring
+                AddOnce(nav, name);      // + auto-route
+                AddOnce(arrows, name);   // + off-screen arrow
+                colors[name] = color;
             }
+            _settings.AtlasHighlightTags = hl;
+            _settings.AtlasNavTags = nav;
+            _settings.AtlasArrowTags = arrows;
+            _settings.AtlasHighlightColors = colors;
             _settings.AtlasTargetsSeeded = true;
             _settings.AtlasRulesInitialized = true;
             changed = true;
@@ -2547,10 +2612,13 @@ public sealed class RadarApp : IDisposable
 
         if (!_settings.AtlasGroupsSeeded)
         {
-            _settings.AtlasGroups ??= new List<AtlasMapGroup>();
-            if (_settings.AtlasGroups.Count == 0)
+            if (_settings.AtlasGroups is not { Count: > 0 })
+            {
+                var seeded = new List<AtlasMapGroup>(DefaultAtlasGroups.Length);   // copy-on-write, as above
                 foreach (var (name, color, maps) in DefaultAtlasGroups)
-                    _settings.AtlasGroups.Add(new AtlasMapGroup { Name = name, Color = color, Maps = new List<string>(maps) });
+                    seeded.Add(new AtlasMapGroup { Name = name, Color = color, Maps = new List<string>(maps) });
+                _settings.AtlasGroups = seeded;
+            }
             _settings.AtlasGroupsSeeded = true;
             changed = true;
         }
@@ -2610,20 +2678,26 @@ public sealed class RadarApp : IDisposable
             : (long)Math.Round(cxSum / onCount) * 73856093L
             ^ (long)Math.Round(cySum / onCount) * 19349663L
             ^ (long)Math.Round(_atlasZoom * 2000f) * 83492791L;
+        // The rule/selection inputs are hashed by CONTENT, not by count: swapping one tag for another,
+        // recolouring a rule, or selecting a different node leaves every count unchanged, and a count-only
+        // signature kept the old marks frozen on screen until the next pan/zoom.
+        long selSig = 0; foreach (var el in sel) selSig += (long)el * 0x9E3779B1L;   // order-independent
         long inputSig = (long)(startGrid?.GetHashCode() ?? 0)
             ^ ((long)(goalGrid?.GetHashCode() ?? 0) << 1)
-            ^ ((long)(_settings.AtlasHighlightTags?.Count ?? 0) << 20)
-            ^ ((long)(_settings.AtlasArrowTags?.Count ?? 0) << 28)
-            ^ ((long)sel.Count << 36)
             ^ (_settings.AtlasDrawAll ? 1L << 44 : 0L);
         long sig = viewSig * 2654435761L ^ inputSig;
+        sig = sig * 1000003L ^ HashStrings(_settings.AtlasHighlightTags);
+        sig = sig * 1000003L ^ HashStrings(_settings.AtlasArrowTags);
+        sig = sig * 1000003L ^ HashStrings(_settings.AtlasNavTags);                 // re-solve when the nav set changes
+        sig = sig * 1000003L ^ HashColors(_settings.AtlasHighlightColors);
+        sig = sig * 1000003L ^ selSig;
         sig = sig * 1000003L ^ (curGrid?.GetHashCode() ?? 0);                       // re-solve routes as the player moves
         sig = sig * 1000003L ^ (_settings.AtlasAutoRoute ? 1L : 0L) ^ ((long)_settings.AtlasAutoRouteMaxHops << 1);
-        sig = sig * 1000003L ^ (long)(_settings.AtlasNavTags?.Count ?? 0);          // re-solve when the nav set changes
         sig = sig * 1000003L ^ ((long)_atlas.GraphNodeCount << 8);                  // re-solve when the edge vector grows (atlas streams in)
         // Rebuild when the #3 hide filters, #5 icon toggle, or #7 group set change.
         sig = sig * 1000003L ^ (_settings.AtlasHideCompleted ? 2L : 0L) ^ (_settings.AtlasHideAccessible ? 4L : 0L)
-            ^ (_settings.AtlasShowContentIcons ? 8L : 0L) ^ ((long)(_settings.AtlasGroups?.Count ?? 0) << 4);
+            ^ (_settings.AtlasShowContentIcons ? 8L : 0L);
+        sig = sig * 1000003L ^ HashGroups(_settings.AtlasGroups);
         if (_builtAtlasOnce && _atlas.AllTagsResolved && sig == _lastAtlasSig)
             return;   // view + inputs unchanged → marks/route stay frozen (off-screen arrows don't jitter)
         _lastAtlasSig = sig; _builtAtlasOnce = true;
@@ -2773,11 +2847,47 @@ public sealed class RadarApp : IDisposable
                 if (frontier.Count > 0 && _atlas.RoutesFromSources(frontier, new[] { goalG }).TryGetValue(goalG, out var best) && best.Count > 0)
                     effStart = best[0];
             }
-            _atlasRouteStartResolved = effStart;
         }
-        else _atlasRouteStartResolved = null;
+        // Read by the API thread (AtlasJson) — a nullable tuple isn't torn-read-safe, so publish under the lock.
+        var resolvedStart = startGrid is null && goalGrid is not null ? effStart : null;
+        lock (_atlasLock) _atlasRouteStartResolved = resolvedStart;
         var (start, end, route) = BuildAtlasRoute(nodes, effStart, goalGrid);
         _atlasRender = new AtlasRender(true, marks, start, end, route, currentPt, autoRoutes);   // publish atomically
+    }
+
+    // ── Content hashes for the atlas freeze signature (UpdateAtlas). Cheap: a few dozen short strings. ──
+    private static long HashStrings(IReadOnlyList<string>? items)
+    {
+        if (items is null) return 0;
+        long h = 17;
+        for (var i = 0; i < items.Count; i++)
+            h = h * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(items[i] ?? "");
+        return h;
+    }
+
+    private static long HashColors(Dictionary<string, string>? colors)
+    {
+        if (colors is null) return 0;
+        long h = 0;   // order-independent (dictionary enumeration order isn't stable across rebuilds)
+        foreach (var kv in colors)
+            h += (long)StringComparer.OrdinalIgnoreCase.GetHashCode(kv.Key) * 31
+                 + StringComparer.OrdinalIgnoreCase.GetHashCode(kv.Value ?? "");
+        return h;
+    }
+
+    private static long HashGroups(IReadOnlyList<AtlasMapGroup>? groups)
+    {
+        if (groups is null) return 0;
+        long h = 17;
+        for (var i = 0; i < groups.Count; i++)
+        {
+            var g = groups[i];
+            if (g is null) continue;
+            h = h * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(g.Name ?? "");
+            h = h * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(g.Color ?? "");
+            h = h * 31 + HashStrings(g.Maps);
+        }
+        return h;
     }
 
     /// <summary>Resolve the F10 START/END grid coords to canvas-space (relPos) points for the markers, and —
@@ -2876,9 +2986,6 @@ public sealed class RadarApp : IDisposable
 
     [DllImport("user32.dll")]
     private static extern nint GetForegroundWindow();
-
-    [StructLayout(LayoutKind.Sequential)] private struct CursorPoint { public int X, Y; }
-    [DllImport("user32.dll")] private static extern bool GetCursorPos(out CursorPoint p);
 
     // Raise the system timer resolution to 1 ms so the render-loop frame pacer (Thread.Sleep) is accurate.
     // Without this, Windows' default ~15.6 ms timer granularity caps ANY Thread.Sleep-paced loop at ~64 fps —

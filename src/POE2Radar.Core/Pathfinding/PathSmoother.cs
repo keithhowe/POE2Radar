@@ -60,8 +60,12 @@ public static class PathSmoother
             if (pf.Read(x, y) < minWalkable) return false;
             if (x == b.X && y == b.Y) return true;
             int e2 = 2 * err;
-            if (e2 >= dy) { err += dy; x += sx; }
-            if (e2 <= dx) { err += dx; y += sy; }
+            bool stepX = e2 >= dy, stepY = e2 <= dx;
+            // A diagonal step (both axes at once) must not pass between two blocked orthogonal cells —
+            // same closed-corner rule as the A* neighbour expansion.
+            if (stepX && stepY && pf.Read(x + sx, y) < minWalkable && pf.Read(x, y + sy) < minWalkable) return false;
+            if (stepX) { err += dy; x += sx; }
+            if (stepY) { err += dx; y += sy; }
         }
     }
 }

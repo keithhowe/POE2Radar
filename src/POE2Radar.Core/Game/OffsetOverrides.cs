@@ -48,9 +48,31 @@ public static class OffsetOverrides
     /// <summary>Human-readable "Class.Field 0xOLD -> 0xNEW" lines for every override that actually
     /// CHANGED a value. An entry equal to the built-in default is not listed — it is a no-op, and
     /// listing it would make a stale file look like it is doing something.</summary>
-    public static IReadOnlyList<string> Applied => AppliedList;
+    public static IReadOnlyList<string> Applied
+    {
+        get
+        {
+            EnsureOffsetTableInitialized();
+            lock (AppliedList) return AppliedList.ToArray();   // snapshot — Note() appends from any thread
+        }
+    }
 
     static OffsetOverrides() => Load();
+
+    /// <summary>Run every <see cref="Poe2"/> offset class's static initializer now. They are lazy
+    /// (first field access), so without this an early <see cref="Describe"/>/<see cref="Applied"/> —
+    /// e.g. the startup banner, printed before anything has read an offset — would see no overrides
+    /// applied yet and report "no value differed" for a file full of real ones.</summary>
+    private static void EnsureOffsetTableInitialized()
+    {
+        static void Init(Type t)
+        {
+            System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(t.TypeHandle);
+            foreach (var n in t.GetNestedTypes(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic))
+                Init(n);
+        }
+        Init(typeof(Poe2));
+    }
 
     private static void Load()
     {
@@ -121,8 +143,12 @@ public static class OffsetOverrides
 
     private static bool TryLookup(string key, out double v) => Values.TryGetValue(key, out v);
 
-    private static void Note(string key, string oldText, string newText) =>
-        AppliedList.Add($"{key} {oldText} -> {newText}");
+    // Called from the Poe2.* type initializers, which run lazily on whichever thread first touches each
+    // class (world / render / API) — so the list needs a lock.
+    private static void Note(string key, string oldText, string newText)
+    {
+        lock (AppliedList) AppliedList.Add($"{key} {oldText} -> {newText}");
+    }
 
     /// <summary>Offset lookup: the override for <paramref name="key"/> ("Class.Field") or
     /// <paramref name="fallback"/>. Every field in <see cref="Poe2"/> is seeded through here.</summary>
@@ -159,8 +185,9 @@ public static class OffsetOverrides
     {
         if (LoadError != null) return $"Offsets: override file FAILED to load ({LoadError}) — using built-in defaults.";
         if (!Loaded) return $"Offsets: built-in defaults (no {SourcePath}).";
-        return AppliedList.Count == 0
+        var applied = Applied;   // forces the offset table to initialise, then snapshots
+        return applied.Count == 0
             ? $"Offsets: loaded {SourcePath} — no value differed from the built-in defaults."
-            : $"Offsets: {AppliedList.Count} override(s) from {SourcePath} — {string.Join(", ", AppliedList)}";
+            : $"Offsets: {applied.Count} override(s) from {SourcePath} — {string.Join(", ", applied)}";
     }
 }

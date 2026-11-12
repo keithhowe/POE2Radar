@@ -10,21 +10,23 @@ namespace POE2Radar.Core.Game;
 /// </summary>
 public static class CustomLandmarkData
 {
-    private static Dictionary<string, Dictionary<string, string>>? _data;
+    // Built once, published only when complete (Lazy = thread-safe): the world thread's landmark scan and
+    // the API thread's dashboard listing both call Load(), and must never see a half-filled table.
+    private static readonly Lazy<Dictionary<string, Dictionary<string, string>>> Data = new(Build);
 
-    public static IReadOnlyDictionary<string, Dictionary<string, string>> Load()
+    public static IReadOnlyDictionary<string, Dictionary<string, string>> Load() => Data.Value;
+
+    private static Dictionary<string, Dictionary<string, string>> Build()
     {
-        if (_data != null) return _data;
-
-        _data = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        var data = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var asm = Assembly.GetExecutingAssembly();
             var resName = asm.GetManifestResourceNames().FirstOrDefault(n => n.Contains("CustomLandmarks"));
-            if (resName == null) return _data;
+            if (resName == null) return data;
 
             using var stream = asm.GetManifestResourceStream(resName);
-            if (stream == null) return _data;
+            if (stream == null) return data;
 
             var doc = JsonDocument.Parse(stream);
             foreach (var areaProp in doc.RootElement.EnumerateObject())
@@ -39,14 +41,14 @@ public static class CustomLandmarkData
                     cleanPath = cleanPath.Replace(".tdtx", ".tdt");
                     tiles[cleanPath] = tileProp.Value.GetString() ?? tileProp.Name;
                 }
-                _data[areaCode] = tiles;
+                data[areaCode] = tiles;
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to load custom landmarks: {ex.Message}");
         }
-        return _data;
+        return data;
     }
 
     public static string? TryMatch(string areaCode, string tilePath)

@@ -94,9 +94,7 @@ public sealed class ModCatalog
     {
         try
         {
-            var dir = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(_filePath, JsonSerializer.Serialize(_mods.ToList(), Json));
+            Config.AtomicFile.WriteAllText(_filePath, JsonSerializer.Serialize(_mods.ToList(), Json));
         }
         catch (Exception ex) { Console.Error.WriteLine($"Mod catalog save failed: {ex.Message}"); }
     }

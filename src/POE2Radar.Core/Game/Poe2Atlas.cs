@@ -23,15 +23,15 @@ public sealed class Poe2Atlas
     private readonly MemoryReader _reader;
     private readonly object _lock = new();
 
-    private volatile int _catalogBaseLo, _catalogBaseHi; // first catalog entry split into two ints for volatile access (0 = not located)
+    private long _catalogBase;           // first catalog entry (0 = not located); read/written atomically via CatalogBase
     private int _catalogCount;
     private volatile bool _scanning;     // a background locate is in flight
     private nint _scanLo, _scanHi;       // game-heap slab to scan (derived from the live chain anchor)
 
     private nint CatalogBase
     {
-        get => (nint)(((long)(uint)_catalogBaseHi << 32) | (uint)_catalogBaseLo);
-        set { _catalogBaseLo = (int)(long)value; _catalogBaseHi = (int)((long)value >> 32); }
+        get => (nint)Interlocked.Read(ref _catalogBase);
+        set => Interlocked.Exchange(ref _catalogBase, (long)value);
     }
 
     private const int Stride = 0x18;
@@ -72,29 +72,26 @@ public sealed class Poe2Atlas
     /// robust to ASLR across sessions. Pass 0 only as a last resort (scans every readable region).</para></summary>
     public AtlasData Read(nint anchor = 0)
     {
-        var baseAddr = CatalogBase;
-        // Cache hit: re-validate cheaply, then walk (fast). No scan.
-        if (baseAddr != 0 && IsCatalogEntry(baseAddr) && IsCatalogEntry(baseAddr + Stride))
-        {
-            var catalog = WalkCatalog(baseAddr, _catalogCount);
-            if (catalog.Count == 0) { CatalogBase = 0; return NotLocated("Catalog cache stale; refresh to re-scan."); }
-            var byParsed = new Dictionary<nint, MapType>(catalog.Count);
-            foreach (var m in catalog) byParsed[(nint)m.ParsedObj] = m;
-            var region = ReadRegion(byParsed, baseAddr);
-            var note = region.Count == 0 ? "Current-region map set not located (catalog still valid)." : "";
-            return new AtlasData(true, (long)baseAddr, catalog.Count, catalog, region, note);
-        }
+        // Cache hit: re-validate cheaply, then walk (fast). No scan. A cache that no longer validates is
+        // RESET in there, so we fall through to the normal rescan path below.
+        if (TryReadCached(out var cached)) return cached;
 
         // Not located yet — kick off (or report) a one-time BACKGROUND scan. The slab scan is seconds-
         // long, so it must not block the API thread; the dashboard polls/refreshes until it's ready.
-        if (_scanning) return NotLocated("Scanning game memory for the atlas catalog… (one-time, ~1–2 min) — refresh shortly.");
+        const string scanningNote = "Scanning game memory for the atlas catalog… (one-time, ~1–2 min) — refresh shortly.";
+        if (_scanning) return NotLocated(scanningNote);
         if (anchor == 0) return NotLocated("Not in game / no anchor yet — open the Atlas, then refresh.");
 
         var lo = (nint)((long)anchor & ~0xFF_FFFF_FFFFL);          // 1 TB-aligned slab containing the anchor
         var hi = (nint)((long)lo + 0x100_0000_0000L);
         lock (_lock)
         {
-            if (_scanning || CatalogBase != 0) return Read(anchor); // another thread won the race
+            if (_scanning) return NotLocated(scanningNote);
+            // Another thread's scan finished between our check and the lock: serve its result. One attempt,
+            // never a recursive Read — if that base doesn't validate either, TryReadCached has reset it and
+            // the next call rescans. (Recursing here looped forever on a stale base → stack overflow.)
+            if (CatalogBase != 0)
+                return TryReadCached(out cached) ? cached : NotLocated("Catalog cache stale; refresh to re-scan.");
             _scanning = true;
         }
         System.Threading.Tasks.Task.Run(() =>
@@ -108,7 +105,35 @@ public sealed class Poe2Atlas
             }
             finally { _scanning = false; }
         });
-        return NotLocated("Scanning game memory for the atlas catalog… (one-time, ~1–2 min) — refresh shortly.");
+        return NotLocated(scanningNote);
+    }
+
+    /// <summary>Serve the read from the cached catalog base, if there is one and it still validates. A
+    /// base that no longer looks like the catalog (game exited / restarted, table relocated) is reset to
+    /// "not located" so the caller rescans instead of re-testing the same dead address forever.</summary>
+    private bool TryReadCached(out AtlasData data)
+    {
+        data = null!;
+        var baseAddr = CatalogBase;
+        if (baseAddr == 0) return false;
+        if (IsCatalogEntry(baseAddr) && IsCatalogEntry(baseAddr + Stride))
+        {
+            var catalog = WalkCatalog(baseAddr, _catalogCount);
+            if (catalog.Count > 0)
+            {
+                var byParsed = new Dictionary<nint, MapType>(catalog.Count);
+                foreach (var m in catalog) byParsed[(nint)m.ParsedObj] = m;
+                var region = ReadRegion(byParsed, baseAddr);
+                var note = region.Count == 0 ? "Current-region map set not located (catalog still valid)." : "";
+                data = new AtlasData(true, (long)baseAddr, catalog.Count, catalog, region, note);
+                return true;
+            }
+        }
+        lock (_lock)
+        {
+            if (CatalogBase == baseAddr) { CatalogBase = 0; _catalogCount = 0; }   // don't clobber a newer scan result
+        }
+        return false;
     }
 
     private static AtlasData NotLocated(string note)
@@ -286,7 +311,11 @@ public sealed class Poe2Atlas
         public (int X, int Y) Grid => (GridX, GridY);
         public bool Unlocked => (Flags & 0x01) != 0;
         public bool Visited => (Flags & 0x02) != 0;
-        public bool HasContent => Content != 0;   // +0x310 (atlas-row ptr) non-null ⇒ has rolled content
+        // Has rolled content ⇔ any content tag resolved (headline / league mechanic / content badge). The
+        // element's Content slot is only consulted when it is a real field (see ContentSlotValid) — on the
+        // current build it aliases GridPos, where "!= 0" just meant "GridX != 0". Reads false until the
+        // node's tags have been resolved (budgeted over the first few reads — see AllTagsResolved).
+        public bool HasContent => Content != 0 || Tags is { Count: > 0 };
         // Completed comes from the node-data status byte (*(node+0x10)+0x20 +0x2CF == 0; StatusRaw keeps the
         // raw value: 0 completed, 255 no state, 1 unresolved — NOT runnable). Accessible ("you can run this
         // now", the route SOURCE frontier) is DERIVED in ReadCanvasNodes from graph adjacency to a completed
@@ -388,6 +417,7 @@ public sealed class Poe2Atlas
         var count = ((long)last - (long)first) / 8;
         if (count is <= 0 or > 20000) { Invalidate(); return false; }
 
+        var startCount = outNodes.Count;   // so a rejected read can hand back exactly what it was given
         var matched = 0;
         var resolveBudget = 80;  // cap new content resolves per call → spread the first-read cost
         var allCached = true;    // false if any node was left unresolved this pass (budget spent)
@@ -397,7 +427,10 @@ public sealed class Poe2Atlas
             if (el == 0 || Ptr(el) != _nodeVtable) continue;     // vtable == node class
             matched++;
             _reader.TryReadStruct<uint>(el + Poe2.AtlasNode.MapNodeId, out var id);
-            _reader.TryReadStruct<uint>(el + Poe2.AtlasNode.Content, out var content);
+            // Content slot: read ONLY when it is its own field. While it aliases GridPos (current build) it
+            // would report GridX as "content" — same reasoning as iconType below; emit 0 instead.
+            uint content = 0;
+            if (ContentSlotValid) _reader.TryReadStruct<uint>(el + Poe2.AtlasNode.Content, out content);
             _reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var state);
             _reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Biome, out var biome);
             _reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var flags);
@@ -446,7 +479,14 @@ public sealed class Poe2Atlas
             outNodes.Add(new AtlasNodeLive(el, id, content, state, biome, flags, compl, x, y, w, h, scale, visible, iconType, gridX, gridY, resolved.map, resolved.code, resolved.content, accessible, completed, kind,
                 meta.Type ?? "", meta.Group ?? "", meta.Tags ?? NoTags, statusRaw));
         }
-        if (matched < 8) { Invalidate(); return false; }          // canvas no longer the node container
+        if (matched < 8)                                           // canvas no longer the node container
+        {
+            // Hand the list back as we got it: the caller falls through to re-detect and may read into the
+            // same list again, so leftovers here would come out as stray / duplicate nodes.
+            outNodes.RemoveRange(startCount, outNodes.Count - startCount);
+            Invalidate();
+            return false;
+        }
         AllTagsResolved = allCached;   // true once every node's tags are cached (seed defaults only then)
         EnsureGraph();                 // (re)read the connection-edge vector (rebuilt whenever it grows)
         // Runnable ("accessible") = the game rule, derived from the graph: not completed AND adjacent to a
@@ -468,6 +508,13 @@ public sealed class Poe2Atlas
     /// budget-limited per read, so it takes a few reads after opening the atlas). Lets callers seed
     /// defaults only when the full map/content set is available.</summary>
     public bool AllTagsResolved { get; private set; }
+
+    /// <summary>True when <see cref="Poe2.AtlasNode.Content"/> is a field of its own. On the current build
+    /// the committed offset is the SAME slot as <see cref="Poe2.AtlasNode.GridPos"/> (the content-row pointer
+    /// was repurposed — see the offset table), so it must not be read as content or dereferenced as a row.
+    /// Derived from the offset table rather than hard-coded, so re-pointing Content (source or offsets.json)
+    /// once the real field is re-discovered switches the content-row reads back on with no code change.</summary>
+    private static bool ContentSlotValid => Poe2.AtlasNode.Content != Poe2.AtlasNode.GridPos;
 
     private void Invalidate() { _nodeCanvas = 0; _nodeVtable = 0; _hiddenTicks = 0; _tagCache.Clear(); _graph.Clear(); _graphCanvas = 0; _graphBegin = 0; _graphEnd = 0; _currentMarker = 0; }
 
@@ -821,9 +868,11 @@ public sealed class Poe2Atlas
 
         var tags = new List<string>(4);
 
-        // Rolled content lives on the EndgameMapAtlas row at +0x310 (null ⇒ no headline/mechanic content,
-        // but the node may still carry CONTENT BADGES — read below regardless).
-        var row = Ptr(el + 0x310);
+        // Rolled content lives on the EndgameMapAtlas row at AtlasNode.Content (null ⇒ no headline/mechanic
+        // content, but the node may still carry CONTENT BADGES — read below regardless). Skipped while that
+        // slot aliases GridPos (current build): the two grid ints read as a "pointer" (Y<<32 | X) pass the
+        // canonical check for any GridY ≥ 1 and would be dereferenced as a row.
+        var row = ContentSlotValid ? Ptr(el + Poe2.AtlasNode.Content) : 0;
         if (row != 0)
         {
             // Headline content: row+0x38 → content row; +0x30 is a pointer to the (NUL-terminated UTF-16)

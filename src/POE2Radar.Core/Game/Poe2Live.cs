@@ -28,6 +28,11 @@ public sealed class Poe2Live
     private readonly Dictionary<nint, string[]> _mods = new();     // entity → affix mod ids (static per spawn; cached; empty = no mods)
     private readonly Dictionary<nint, (Rarity rarity, string? art, bool identified, string? name)> _itemIdent = new(); // WorldItem entity → dropped-item identity (static; cached)
     private readonly Dictionary<nint, uint> _idAt = new();         // entity address → last-seen std::map key id (recycle guard)
+    // entity → number of FAILED (unreadable, as opposed to "component absent") lookups so far. A failed read
+    // is not frozen into the caches above — it is retried on later passes until this budget is spent, after
+    // which the empty result is accepted so a permanently unreadable entity isn't re-walked every tick.
+    private readonly Dictionary<nint, int> _resolveFails = new();
+    private const int ResolveRetryLimit = 32;
     // Bounds the number of NEW (uncached) monster mod reads per Entities() pass so walking into a large
     // pack can't stall the world tick. Cached monsters cost nothing; new ones fill over a few ticks.
     private int _modReadBudget;
@@ -105,7 +110,7 @@ public sealed class Poe2Live
     {
         inGameState = areaInstance = localPlayer = 0;
         var gameState = Ptr(_gameStateSlot);
-        if (gameState == 0) return false;
+        if (gameState == 0) { _resolvedArea = 0; return false; }
 
         // InGameState = first element of the CurrentStatePtr StdVector; fall back to States[].
         var candidates = new List<nint>(13);
@@ -123,9 +128,31 @@ public sealed class Poe2Live
             if (lp == 0) continue;
             if (!ReadMetadata(lp).StartsWith("Metadata/", StringComparison.Ordinal)) continue;
             inGameState = igs; areaInstance = ai; localPlayer = lp;
+            _resolvedArea = ai;
             return true;
         }
+        _resolvedArea = 0;   // not in game (loading screen / character select)
         return false;
+    }
+
+    // AreaInstance last resolved by TryResolve on THIS instance (0 while not in game). Part of the
+    // local-player component cache key (see PlayerComponent), so those caches turn over on a zone change
+    // even on a reader stack that never calls Entities().
+    private nint _resolvedArea;
+
+    // Bounded retry for per-area reads that came back EMPTY (AreaInfo / ServerData / terrain not populated
+    // yet on the first ticks of a zone): keep re-reading for this many calls, then accept the empty result
+    // so a genuinely unreadable field doesn't cost reads every tick for the whole area.
+    private const int AreaReadRetries = 150;
+
+    /// <summary>True when a per-area cached string must be (re)read: a new area, or still empty with
+    /// retries left.</summary>
+    private static bool NeedAreaRead(nint areaInstance, ref nint cachedFor, ref int tries, string current)
+    {
+        if (areaInstance != cachedFor) { cachedFor = areaInstance; tries = 0; return true; }
+        if (current.Length > 0 || tries >= AreaReadRetries) return false;
+        tries++;
+        return true;
     }
 
     /// <summary>Per-area instance hash. (Caches key on the AreaInstance address; this is for display/ID.)</summary>
@@ -142,75 +169,98 @@ public sealed class Poe2Live
         return l;
     }
 
-    private string _areaCode = ""; private nint _areaCodeFor = -1;
+    private string _areaCode = ""; private nint _areaCodeFor = -1; private int _areaCodeTries;
 
-    /// <summary>Area code identifier (e.g. "G1_town"). Cached per area.</summary>
+    /// <summary>Area code identifier (e.g. "G1_town"). Cached per area (an empty read is retried, bounded).</summary>
     public string AreaCode(nint areaInstance)
     {
-        if (areaInstance == _areaCodeFor) return _areaCode;
-        _areaCodeFor = areaInstance;
+        if (!NeedAreaRead(areaInstance, ref _areaCodeFor, ref _areaCodeTries, _areaCode)) return _areaCode;
         var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
-        var s = Ptr(info + Poe2.AreaInfo.Code);
+        var s = info == 0 ? 0 : Ptr(info + Poe2.AreaInfo.Code);
         _areaCode = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
         return _areaCode;
     }
 
-    private string _areaName = ""; private nint _areaNameFor = -1;
+    private string _areaName = ""; private nint _areaNameFor = -1; private int _areaNameTries;
 
-    /// <summary>Area display name (e.g. "Clearfell Encampment"). Cached per area.</summary>
+    /// <summary>Area display name (e.g. "Clearfell Encampment"). Cached per area (an empty read is retried, bounded).</summary>
     public string AreaName(nint areaInstance)
     {
-        if (areaInstance == _areaNameFor) return _areaName;
-        _areaNameFor = areaInstance;
+        if (!NeedAreaRead(areaInstance, ref _areaNameFor, ref _areaNameTries, _areaName)) return _areaName;
         var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
-        var s = Ptr(info + Poe2.AreaInfo.Name);
+        var s = info == 0 ? 0 : Ptr(info + Poe2.AreaInfo.Name);
         _areaName = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
         return _areaName;
     }
 
-    private string _league = ""; private nint _leagueFor = -1;
+    private string _league = ""; private nint _leagueFor = -1; private int _leagueTries;
 
     /// <summary>Current league name as the game stores it (ServerData @ AreaInstance+0x580 → std::wstring
     /// +0x21E0). Matches poe.ninja/poe2scout's league Value verbatim, including the "HC " prefix — so it
     /// disambiguates the two IsCurrent leagues (softcore vs hardcore) for price auto-detect. Cached per area.</summary>
     public string LeagueName(nint areaInstance)
     {
-        if (areaInstance == _leagueFor) return _league;
-        _leagueFor = areaInstance;
+        if (!NeedAreaRead(areaInstance, ref _leagueFor, ref _leagueTries, _league)) return _league;
         var serverData = Ptr(areaInstance + Poe2.AreaInstance.ServerDataPtr);
         _league = serverData == 0 ? "" : ReadStdWString(serverData + Poe2.ServerData.League);
         return _league;
     }
 
-    private nint _plPlayer, _plPlayerFor;
-    private nint PlayerComp(nint localPlayer)
+    // Local-player component caches (Player / Life / Render). Keyed on the local-player entity AND the
+    // AreaInstance last seen by TryResolve, re-resolved while the address is still 0, and refreshed about
+    // once a second. They can't lean on the per-entity caches below: those are only invalidated inside
+    // Entities(), which a render-rate reader stack never calls, and an entity address can be reused by the
+    // next zone's player with different component addresses. The key (For) is published LAST, after the
+    // address, so a reader never pairs the new key with the previous player's component.
+    private struct PlayerCompCache { public nint For, Area, Addr; public long RefreshAt; }
+    private PlayerCompCache _plPlayer, _plLife, _plRender;
+    private const int PlayerCompRefreshMs = 1000;
+
+    private nint PlayerComponent(ref PlayerCompCache c, nint localPlayer, string name)
     {
-        if (localPlayer != _plPlayerFor) { _plPlayerFor = localPlayer; _plPlayer = ResolveComponent(localPlayer, "Player"); }
-        return _plPlayer;
+        if (localPlayer == 0) return 0;
+        var now = Environment.TickCount64;
+        var keyChanged = localPlayer != c.For || _resolvedArea != c.Area;
+        if (keyChanged || c.Addr == 0 || now >= c.RefreshAt)
+        {
+            var addr = ResolveComponent(localPlayer, name);
+            if (addr != 0 || keyChanged) c.Addr = addr;   // a failed periodic refresh keeps the last good address
+            c.RefreshAt = now + PlayerCompRefreshMs;
+            c.Area = _resolvedArea;
+            c.For = localPlayer;
+        }
+        return c.Addr;
     }
 
     /// <summary>Local character name (validated via StdWString @ Player+0x1B0).</summary>
     public string PlayerName(nint localPlayer)
     {
-        var c = PlayerComp(localPlayer);
+        var c = PlayerComponent(ref _plPlayer, localPlayer, "Player");
         return c == 0 ? "" : ReadStdWString(c + Poe2.PlayerComponent.Name);
     }
 
     /// <summary>Local character level (byte @ Player+0x204).</summary>
     public int PlayerLevel(nint localPlayer)
     {
-        var c = PlayerComp(localPlayer);
+        var c = PlayerComponent(ref _plPlayer, localPlayer, "Player");
         return c != 0 && _reader.TryReadStruct<byte>(c + Poe2.PlayerComponent.Level, out var b) ? b : 0;
     }
 
     /// <summary>Player grid position (from the Render component's world position ÷ grid ratio).</summary>
-    public System.Numerics.Vector2? PlayerGrid(nint localPlayer) => EntityGrid(localPlayer);
+    public System.Numerics.Vector2? PlayerGrid(nint localPlayer)
+        => PlayerWorld(localPlayer) is { } w
+            ? new System.Numerics.Vector2(w.X / Poe2.WorldToGridRatio, w.Y / Poe2.WorldToGridRatio) : null;
 
     /// <summary>Player world position (the Render component's CurrentWorldPosition, incl. Z). RENDER-RATE
-    /// safe — resolves + caches the player's Render component on demand (same path as <see cref="PlayerGrid"/>),
-    /// so the render thread can anchor the guidance line at the player's live feet without the local player
-    /// needing to be in the (world-rate) entity list.</summary>
-    public Vector3? PlayerWorld(nint localPlayer) => EntityWorld(localPlayer);
+    /// safe — resolves + caches the player's Render component on demand in its own local-player cache
+    /// (see <see cref="PlayerComponent"/>), so the render thread can anchor the guidance line at the player's
+    /// live feet without the local player needing to be in the (world-rate) entity list.</summary>
+    public Vector3? PlayerWorld(nint localPlayer)
+    {
+        var render = PlayerComponent(ref _plRender, localPlayer, "Render");
+        if (render == 0 || !_reader.TryReadStruct<Vector3>(render + Poe2.Render.CurrentWorldPosition, out var w)) return null;
+        return w;
+    }
 
     public readonly record struct Vitals(int HpCur, int HpUnreserved, int ManaCur, int ManaUnreserved,
         int EsCur, int EsUnreserved)
@@ -223,12 +273,10 @@ public sealed class Poe2Live
         public bool  HasEs   => EsUnreserved > 0;
     }
 
-    private nint _plLife, _plLifeFor;
-
     // Self-healing vital offsets. Components are resolved by NAME (robust across patches), but the
     // VitalStruct offsets WITHIN the Life component slide between patches (e.g. 2026-06-04: Health
     // 0x1A8→0x1B0, Mana 0x1F8→0x208, ES 0x230→0x248 — each by a different small amount). We validate
-    // each configured offset against a live Life component once; if it doesn't read a valid pool we
+    // each configured offset against a live Life component; if it doesn't read a valid pool we
     // re-anchor it (see ResolveVitalOffset) so a minor layout shift degrades gracefully (auto-flask +
     // HP bars keep working) instead of silently reading 0. The same offsets back the monster HP reads
     // (identical component layout). Logged loudly so the table still gets updated.
@@ -239,7 +287,11 @@ public sealed class Poe2Live
     // and misfiring the flask.
     private int _healthOff = Poe2.Life.Health, _manaOff = Poe2.Life.Mana, _esOff = Poe2.Life.EnergyShield;
     private bool _esOffKnown = true;
-    private bool _vitalOffsetsResolved;
+    // Life component the offsets were last validated against (0 = never). The ES / Mana verdicts are
+    // re-resolved whenever the player's Life component changes (new zone / character) instead of being
+    // latched for the process, so one unlucky first read can't pin "ES unconfirmed" for the whole session.
+    // Health is searched for once and only re-CONFIRMED after that (see EnsureVitalOffsets).
+    private nint _vitalOffsetsFor;
 
     // Stricter than VitalStruct.LooksValid: ReservedFraction is reservation in basis-points, so a real
     // pool keeps it in [0, 10000]. The Life component is littered with decoy structs that pass the
@@ -247,14 +299,23 @@ public sealed class Poe2Live
     private static bool LooksLikeRealPool(in VitalStruct v)
         => v.LooksValid() && v.ReservedFraction >= 0 && v.ReservedFraction <= 10000;
 
+    // A pool the character simply doesn't have (no energy shield): everything zero. That is a CORRECT read
+    // of a correct offset, not drift.
+    private static bool IsEmptyPool(in VitalStruct v)
+        => v.Max == 0 && v.Current == 0 && v.ReservedFlat == 0 && v.ReservedFraction == 0;
+
     // Resolve one pool's offset within the Life component, healing small drift. Returns the configured
     // offset if it still reads a valid pool (the normal case); otherwise searches a TIGHT window
     // anchored on the configured offset and returns the valid pool nearest to it, or -1 if none. The
     // window is deliberately narrow so the distant decoy VitalStructs (verified live to sit well away
     // from each real pool) stay out of reach — we heal a slide, we don't hunt blindly.
-    private int ResolveVitalOffset(nint lifeComp, int configured)
+    // allowEmpty (ES only): an all-zero pool at the configured offset keeps that offset. Searching the
+    // window for a 0-ES character could only ever land on a decoy, and reporting "unconfirmed" would
+    // suppress the ES read for a character that later gains a shield.
+    private int ResolveVitalOffset(nint lifeComp, int configured, bool allowEmpty = false)
     {
-        if (_reader.TryReadStruct<VitalStruct>(lifeComp + configured, out var v) && v.LooksValid())
+        if (_reader.TryReadStruct<VitalStruct>(lifeComp + configured, out var v)
+            && (v.LooksValid() || (allowEmpty && IsEmptyPool(v))))
             return configured;
         int best = -1, bestDist = int.MaxValue;
         for (var off = Math.Max(0x80, configured - 0x18); off <= configured + 0x30; off += 4)
@@ -270,39 +331,58 @@ public sealed class Poe2Live
 
     private void EnsureVitalOffsets(nint lifeComp)
     {
-        if (_vitalOffsetsResolved || lifeComp == 0) return;
+        if (lifeComp == 0 || lifeComp == _vitalOffsetsFor) return;
 
-        // Health is safety-critical and reliably the FIRST valid pool, so it gets an extra fallback:
-        // if it won't anchor near its configured offset, take the first valid pool in the component.
-        var health = ResolveVitalOffset(lifeComp, Poe2.Life.Health);
-        if (health < 0)
+        int health;
+        if (_vitalOffsetsFor != 0)
         {
-            for (var off = 0x80; off <= 0x400; off += 4)
-                if (_reader.TryReadStruct<VitalStruct>(lifeComp + off, out var v) && LooksLikeRealPool(v)) { health = off; break; }
-            if (health < 0) return; // not in-game yet / unreadable — retry next call (don't latch)
-        }
-
-        _vitalOffsetsResolved = true;
-        _healthOff = health;
-        if (_healthOff != Poe2.Life.Health)
-            Console.WriteLine($"Poe2Live: Life Health offset appears to have drifted — auto-relocated " +
-                $"0x{Poe2.Life.Health:X}->0x{_healthOff:X} (life flask + HP bars keep working). Update " +
-                $"Poe2.Life + re-validate (Research --vitals).");
-
-        // ES self-heals the same way; if it can't be confirmed we suppress the read (safe: ES% → 100).
-        var es = ResolveVitalOffset(lifeComp, Poe2.Life.EnergyShield);
-        _esOffKnown = es >= 0;
-        if (es >= 0)
-        {
-            _esOff = es;
-            if (_esOff != Poe2.Life.EnergyShield)
-                Console.WriteLine($"Poe2Live: Life EnergyShield offset appears to have drifted — auto-relocated " +
-                    $"0x{Poe2.Life.EnergyShield:X}->0x{_esOff:X} (ES flask keeps working). Update Poe2.Life + re-validate (Research --vitals).");
+            // Re-validation on a NEW Life component (zone change). Health was already resolved for this
+            // process, so only CONFIRM it here: a pool that isn't populated yet must never send the
+            // safety-critical Health offset hunting onto some other struct. Not confirmed → keep every
+            // offset as it is and try again next call. (ES / Mana are re-resolved below.)
+            if (!_reader.TryReadStruct<VitalStruct>(lifeComp + _healthOff, out var cur) || !cur.LooksValid()) return;
+            health = _healthOff;
         }
         else
         {
-            Console.WriteLine($"Poe2Live: Life EnergyShield offset (0x{Poe2.Life.EnergyShield:X}) couldn't be confirmed — " +
-                "ES flask trigger suppressed (reads as full) until the table is updated (Research --vitals).");
+            // Health is safety-critical and reliably the FIRST valid pool, so it gets an extra fallback:
+            // if it won't anchor near its configured offset, take the first valid pool in the component.
+            health = ResolveVitalOffset(lifeComp, Poe2.Life.Health);
+            if (health < 0)
+            {
+                for (var off = 0x80; off <= 0x400; off += 4)
+                    if (_reader.TryReadStruct<VitalStruct>(lifeComp + off, out var v) && LooksLikeRealPool(v)) { health = off; break; }
+                if (health < 0) return; // not in-game yet / unreadable — retry next call (don't latch)
+            }
+        }
+
+        _vitalOffsetsFor = lifeComp;
+        // Each message is logged only when the verdict CHANGES, so the per-zone re-validation stays quiet.
+        if (health != _healthOff)
+        {
+            _healthOff = health;
+            if (_healthOff != Poe2.Life.Health)
+                Console.WriteLine($"Poe2Live: Life Health offset appears to have drifted — auto-relocated " +
+                    $"0x{Poe2.Life.Health:X}->0x{_healthOff:X} (life flask + HP bars keep working). Update " +
+                    $"Poe2.Life + re-validate (Research --vitals).");
+        }
+
+        // ES self-heals the same way; if it can't be confirmed we suppress the read (safe: ES% → 100).
+        var es = ResolveVitalOffset(lifeComp, Poe2.Life.EnergyShield, allowEmpty: true);
+        if (es >= 0)
+        {
+            if ((es != _esOff || !_esOffKnown) && es != Poe2.Life.EnergyShield)
+                Console.WriteLine($"Poe2Live: Life EnergyShield offset appears to have drifted — auto-relocated " +
+                    $"0x{Poe2.Life.EnergyShield:X}->0x{es:X} (ES flask keeps working). Update Poe2.Life + re-validate (Research --vitals).");
+            _esOff = es;
+            _esOffKnown = true;
+        }
+        else
+        {
+            if (_esOffKnown)
+                Console.WriteLine($"Poe2Live: Life EnergyShield offset (0x{Poe2.Life.EnergyShield:X}) couldn't be confirmed — " +
+                    "ES flask trigger suppressed (reads as full) until the table is updated (Research --vitals).");
+            _esOffKnown = false;
         }
 
         // Mana: best-effort relocation only. The mana flask is never gated on a confident read — if it
@@ -319,13 +399,13 @@ public sealed class Poe2Live
     /// </summary>
     public Vitals? PlayerVitals(nint localPlayer)
     {
-        if (localPlayer != _plLifeFor) { _plLifeFor = localPlayer; _plLife = ResolveComponent(localPlayer, "Life"); }
-        if (_plLife == 0) return null;
-        EnsureVitalOffsets(_plLife);
-        if (!_reader.TryReadStruct<VitalStruct>(_plLife + _healthOff, out var hp) || hp.Max <= 0) return null;
-        _reader.TryReadStruct<VitalStruct>(_plLife + _manaOff, out var mana);
+        var life = PlayerComponent(ref _plLife, localPlayer, "Life");
+        if (life == 0) return null;
+        EnsureVitalOffsets(life);
+        if (!_reader.TryReadStruct<VitalStruct>(life + _healthOff, out var hp) || hp.Max <= 0) return null;
+        _reader.TryReadStruct<VitalStruct>(life + _manaOff, out var mana);
         VitalStruct es = default; // suppressed (stays 0 → ES% 100) when the offset isn't confirmed
-        if (_esOffKnown) _reader.TryReadStruct<VitalStruct>(_plLife + _esOff, out es);
+        if (_esOffKnown) _reader.TryReadStruct<VitalStruct>(life + _esOff, out es);
         return new Vitals(hp.Current, Unreserved(hp), mana.Current, Unreserved(mana), es.Current, Unreserved(es));
     }
 
@@ -346,6 +426,7 @@ public sealed class Poe2Live
         {
             _renderAddr.Clear(); _lifeAddr.Clear(); _posAddr.Clear(); _ompAddr.Clear(); _chestAddr.Clear();
             _category.Clear(); _meta.Clear(); _iconAddr.Clear(); _rarity.Clear(); _mods.Clear(); _itemIdent.Clear(); _idAt.Clear();
+            _resolveFails.Clear();
             _entCacheKey = areaInstance;
         }
 
@@ -419,6 +500,28 @@ public sealed class Poe2Live
         _renderAddr.Remove(entity); _lifeAddr.Remove(entity); _posAddr.Remove(entity);
         _ompAddr.Remove(entity); _chestAddr.Remove(entity); _category.Remove(entity);
         _meta.Remove(entity); _iconAddr.Remove(entity); _rarity.Remove(entity); _mods.Remove(entity); _itemIdent.Remove(entity);
+        _resolveFails.Remove(entity);
+    }
+
+    /// <summary>True while <paramref name="entity"/> still has failed-read retries left (and spends one):
+    /// the caller then leaves its result UNCACHED so the next pass re-reads it. False once the budget is
+    /// spent — the caller caches whatever it has as final.</summary>
+    private bool RetryLater(nint entity)
+    {
+        var n = _resolveFails.GetValueOrDefault(entity);
+        if (n >= ResolveRetryLimit) return false;
+        _resolveFails[entity] = n + 1;
+        return true;
+    }
+
+    /// <summary>Per-entity component address through <paramref name="cache"/>. A component that is genuinely
+    /// absent is cached as 0 straight away; a lookup that FAILED to read (entity mid-construction, torn
+    /// vector) returns 0 uncached and is retried on later passes, bounded by <see cref="RetryLater"/>.</summary>
+    private nint CachedComponent(Dictionary<nint, nint> cache, nint entity, string name)
+    {
+        if (cache.TryGetValue(entity, out var comp)) return comp;
+        if (TryResolveComponent(entity, name, out comp) || !RetryLater(entity)) cache[entity] = comp;
+        return comp;
     }
 
     /// <summary>
@@ -432,11 +535,7 @@ public sealed class Poe2Live
     /// </summary>
     private (bool poi, bool complete) ReadIcon(nint entity)
     {
-        if (!_iconAddr.TryGetValue(entity, out var icon))
-        {
-            icon = ResolveComponent(entity, "MinimapIcon");
-            _iconAddr[entity] = icon; // cache even if 0, to avoid re-walking non-POI entities
-        }
+        var icon = CachedComponent(_iconAddr, entity, "MinimapIcon"); // absent is cached as 0 → non-POI entities aren't re-walked
         if (icon == 0) return (false, false);
         var complete = _reader.TryReadStruct<int>(icon + Poe2.MinimapIcon.CompletedState, out var s) && s != 0;
         return (true, complete);
@@ -479,33 +578,40 @@ public sealed class Poe2Live
 
         if (!_reader.TryReadStruct<int>(station + Poe2.RuneStation.HoleCount, out var holes) || holes is <= 0 or > 16)
             return fail;
-        _reader.TryReadStruct<int>(station + Poe2.RuneStation.AnchorPos, out var pos);
-
         var rowPtr = Ptr(station + Poe2.RuneStation.AnchorRef);
         if (rowPtr == 0) return new MonolithState(true, holes, -1, -1, true, collected); // anchor-less → "unique"
 
+        // Anchored monolith. A decode FAILURE below is reported as (AnchorIdx −1, AnchorPos −1, IsUnique
+        // false) — distinct from the anchor-less case above — and RuneMonolithCatalog.Offers returns nothing
+        // for it rather than every recipe.
+        var decodeFailed = new MonolithState(true, holes, -1, -1, false, collected);
+        // The anchor hole is a 0-based index into the N holes; anything else is a bad read / drift.
+        if (!_reader.TryReadStruct<int>(station + Poe2.RuneStation.AnchorPos, out var pos) || pos < 0 || pos >= holes)
+            return decodeFailed;
+
         // anchor rune index = (rowPtr − tableBase)/RuneStride; tableBase is per-area (deref holder+0x28).
         var holder = Ptr(station + Poe2.RuneStation.AnchorHolder);
-        var p1 = Ptr(holder + 0x28);
+        var p1 = holder == 0 ? 0 : Ptr(holder + 0x28);
         if (p1 == 0 || !_reader.TryReadStruct<long>(p1, out var tableBase) || tableBase == 0)
-            return new MonolithState(true, holes, -1, pos, false, collected); // station ok, anchor decode failed
+            return decodeFailed; // station ok, anchor decode failed
         var delta = (long)rowPtr - tableBase;
-        var idx = (delta >= 0 && delta % Poe2.RuneStation.RuneStride == 0)
-            ? (int)(delta / Poe2.RuneStation.RuneStride) : -1;
-        if (idx < 0 || idx >= Poe2.RuneStation.RuneCount) idx = -1;
-        return new MonolithState(true, holes, idx, pos, false, collected);
+        var row = (delta >= 0 && delta % Poe2.RuneStation.RuneStride == 0)
+            ? delta / Poe2.RuneStation.RuneStride : -1L;   // range-check as long: a garbage delta must not wrap into range
+        if (row < 0 || row >= Poe2.RuneStation.RuneCount) return decodeFailed;
+        return new MonolithState(true, holes, (int)row, pos, false, collected);
     }
 
     private Rarity ReadRarity(nint entity)
     {
         // Rarity is fixed at spawn — read it once per entity and cache the value (not just the addr).
         if (_rarity.TryGetValue(entity, out var cached)) return cached;
-        if (!_ompAddr.TryGetValue(entity, out var omp))
+        var omp = CachedComponent(_ompAddr, entity, "ObjectMagicProperties");
+        if (omp == 0)
         {
-            omp = ResolveComponent(entity, "ObjectMagicProperties");
-            _ompAddr[entity] = omp;
+            // Normal is final only once the component lookup is (absent / retries spent), not on a failed read.
+            if (_ompAddr.ContainsKey(entity)) _rarity[entity] = Rarity.Normal;
+            return Rarity.Normal;
         }
-        if (omp == 0) { _rarity[entity] = Rarity.Normal; return Rarity.Normal; }
         if (!_reader.TryReadStruct<int>(omp + Poe2.ObjectMagicProperties.Rarity, out var r))
             return Rarity.Normal; // transient read failure — don't poison the cache
         var rarity = r is >= 0 and <= 3 ? (Rarity)r : Rarity.Normal;
@@ -525,12 +631,12 @@ public sealed class Poe2Live
         if (_mods.TryGetValue(entity, out var cached)) return cached.Length == 0 ? null : cached;
         if (_modReadBudget <= 0) return null;                  // out of budget this pass — retry next tick (don't cache)
 
-        if (!_ompAddr.TryGetValue(entity, out var omp))
+        var omp = CachedComponent(_ompAddr, entity, "ObjectMagicProperties");
+        if (omp == 0)
         {
-            omp = ResolveComponent(entity, "ObjectMagicProperties");
-            _ompAddr[entity] = omp;
+            if (_ompAddr.ContainsKey(entity)) _mods[entity] = Array.Empty<string>(); // final only once the lookup is
+            return null;
         }
-        if (omp == 0) { _mods[entity] = Array.Empty<string>(); return null; }
         _modReadBudget--;
 
         // StdVector at omp+Mods: [First, Last, End]. Element stride ModElemStride; each element holds a
@@ -578,12 +684,21 @@ public sealed class Poe2Live
         if (_itemIdent.TryGetValue(entity, out var cached)) return cached;
         if (_itemReadBudget <= 0) return (Rarity.NonMonster, null, true, null);   // out of budget — retry next tick (don't cache)
 
-        var wi = ResolveComponent(entity, "WorldItem");
+        var absent = TryResolveComponent(entity, "WorldItem", out var wi) && wi == 0;
         var item = wi == 0 ? 0 : Ptr(wi + Poe2.WorldItemComponent.ItemEntity);
-        if (item == 0) { var v = (Rarity.NonMonster, (string?)null, true, (string?)null); _itemIdent[entity] = v; return v; }
+        if (item == 0)
+        {
+            // Final only when the entity genuinely has no WorldItem component; a failed read is retried (bounded).
+            var v = (Rarity.NonMonster, (string?)null, true, (string?)null);
+            if (absent || !RetryLater(entity)) _itemIdent[entity] = v;
+            return v;
+        }
         _itemReadBudget--;
 
         var result0 = ReadIdentityFromItem(item);
+        // Neither art nor name ⇒ the inner item's components weren't readable yet: retry (bounded) rather than
+        // freezing an unpriceable identity for the drop's lifetime.
+        if (result0.Item2 is null && result0.Item4 is null && RetryLater(entity)) return result0;
         _itemIdent[entity] = result0;
         return result0;
     }
@@ -664,22 +779,14 @@ public sealed class Poe2Live
 
     private byte ReadReaction(nint entity)
     {
-        if (!_posAddr.TryGetValue(entity, out var pos))
-        {
-            pos = ResolveComponent(entity, "Positioned");
-            _posAddr[entity] = pos;
-        }
+        var pos = CachedComponent(_posAddr, entity, "Positioned");
         if (pos == 0) return 0;
         return _reader.TryReadStruct<byte>(pos + Poe2.Positioned.Reaction, out var b) ? b : (byte)0;
     }
 
     private (int cur, int max) ReadHp(nint entity)
     {
-        if (!_lifeAddr.TryGetValue(entity, out var life))
-        {
-            life = ResolveComponent(entity, "Life");
-            _lifeAddr[entity] = life;
-        }
+        var life = CachedComponent(_lifeAddr, entity, "Life");
         if (life == 0) return (0, 0);
         // Use the (possibly auto-relocated) Health offset so monster HP bars survive the same vital-
         // block drift the player vitals do. _healthOff == Poe2.Life.Health unless drift was detected.
@@ -715,10 +822,14 @@ public sealed class Poe2Live
 
     /// <summary>Drop the cached per-area landmark scan so the next <see cref="Landmarks"/> call rebuilds
     /// it (e.g. after the user edits the custom landmark patterns from the dashboard).</summary>
-    public void InvalidateLandmarks() => _landmarksKey = -1;
+    public void InvalidateLandmarks() { _landmarksKey = -1; _landmarksTriesFor = -1; }
 
     private List<string>? _tilePaths;
     private nint _tilePathsKey = -1;
+    // Failed-scan retry bookkeeping (terrain tile vector not readable yet): the scan result is only latched
+    // as the area's answer once it succeeded or AreaReadRetries attempts were spent.
+    private nint _tilePathsTriesFor = -1; private int _tilePathsTries;
+    private nint _landmarksTriesFor = -1; private int _landmarksTries;
 
     /// <summary>
     /// All DISTINCT terrain-tile paths in the area (sorted), scanned once per area and cached. This is
@@ -728,13 +839,17 @@ public sealed class Poe2Live
     public IReadOnlyList<string> TilePaths(nint areaInstance)
     {
         if (areaInstance == _tilePathsKey && _tilePaths is not null) return _tilePaths;
-        _tilePathsKey = areaInstance;
-        _tilePaths = ScanTilePaths(areaInstance);
-        return _tilePaths;
+        if (areaInstance != _tilePathsTriesFor) { _tilePathsTriesFor = areaInstance; _tilePathsTries = 0; }
+        var paths = ScanTilePaths(areaInstance, out var ok);
+        if (ok || ++_tilePathsTries >= AreaReadRetries) { _tilePathsKey = areaInstance; _tilePaths = paths; }
+        return paths;
     }
 
-    private List<string> ScanTilePaths(nint areaInstance)
+    /// <summary><paramref name="ok"/> is false when the terrain tile vector couldn't be read (as opposed to
+    /// read fine and simply yielding nothing) — the caller then retries instead of caching the empty list.</summary>
+    private List<string> ScanTilePaths(nint areaInstance, out bool ok)
     {
+        ok = false;
         var result = new List<string>();
         var terrain = areaInstance + Poe2.AreaInstance.TerrainMetadata;
         if (!_reader.TryReadStruct<long>(terrain + Poe2.Terrain.TotalTiles, out var tilesX) || tilesX <= 0) return result;
@@ -755,6 +870,7 @@ public sealed class Poe2Live
         }
         result.AddRange(paths);
         result.Sort(StringComparer.Ordinal);
+        ok = true;
         return result;
     }
 
@@ -767,15 +883,23 @@ public sealed class Poe2Live
     public IReadOnlyList<Landmark> Landmarks(nint areaInstance)
     {
         if (areaInstance == _landmarksKey && _landmarks is not null) return _landmarks;
-        _landmarksKey = areaInstance;
-        _landmarks = ScanLandmarks(areaInstance);
-        return _landmarks;
+        if (areaInstance != _landmarksTriesFor) { _landmarksTriesFor = areaInstance; _landmarksTries = 0; }
+        var lastTry = ++_landmarksTries >= AreaReadRetries;
+        var found = ScanLandmarks(areaInstance, lastTry, out var ok);
+        if (ok || lastTry) { _landmarksKey = areaInstance; _landmarks = found; }
+        return found;
     }
 
-    private List<Landmark> ScanLandmarks(nint areaInstance)
+    /// <summary><paramref name="ok"/> is false when the scan's inputs weren't readable yet — the terrain
+    /// tile vector, or the area code the curated labels are keyed on — so the caller retries instead of
+    /// caching an empty (or mislabelled) landmark set for the whole area. On the <paramref name="lastTry"/>
+    /// a still-unknown area code no longer blocks the scan (user Tile rules don't need it).</summary>
+    private List<Landmark> ScanLandmarks(nint areaInstance, bool lastTry, out bool ok)
     {
+        ok = false;
         var result = new List<Landmark>();
         var areaCode = AreaCode(areaInstance);
+        if (areaCode.Length == 0 && !lastTry) return result;   // cheap bail — don't walk the tile grid just to redo it
         var terrain = areaInstance + Poe2.AreaInstance.TerrainMetadata;
         if (!_reader.TryReadStruct<long>(terrain + Poe2.Terrain.TotalTiles, out var tilesX) || tilesX <= 0) return result;
         var first = Ptr(terrain + Poe2.Terrain.TileDetailsPtr);
@@ -830,6 +954,7 @@ public sealed class Poe2Live
                 result.Add(new Landmark(name, path, center, cluster.Count, curated));
             }
         }
+        ok = true;
         return result;
     }
 
@@ -913,6 +1038,8 @@ public sealed class Poe2Live
     private readonly HashSet<nint> _everHidden = new();  // elements observed with visible-bit clear
     private readonly HashSet<nint> _everVisible = new(); // elements observed with visible-bit set
     private nint _mapCacheKey = -1;
+    private long _mapNextDiscover;               // Environment.TickCount64 before which discovery isn't retried
+    private const int MapDiscoverRetryMs = 1000;
 
     /// <summary>
     /// Map UI state. The MapUiElements (DefaultShift=(0,-20), Zoom=0.5) are discovered once per area
@@ -935,13 +1062,24 @@ public sealed class Poe2Live
     /// </summary>
     public MapUi ReadMap(nint inGameState, nint areaInstance)
     {
-        if (areaInstance != _mapCacheKey || _mapEls.Count == 0)
+        if (areaInstance != _mapCacheKey)
         {
             _mapCacheKey = areaInstance;
             _mapEls.Clear();
             _everHidden.Clear();
             _everVisible.Clear();
+            _mapNextDiscover = 0;   // new area: discover right away
+        }
+        if (_mapEls.Count == 0)
+        {
+            // Discovery BFS-walks the whole UI tree, and this runs on the render thread every frame. While
+            // it finds nothing (offsets drifted, UI not built yet) retry at most about once a second
+            // instead of burning that walk per frame.
+            var now = Environment.TickCount64;
+            if (now < _mapNextDiscover) return default;
+            _mapNextDiscover = now + MapDiscoverRetryMs;
             DiscoverMapElements(inGameState);
+            if (_mapEls.Count == 0) return default;
         }
 
         var visibleCount = 0;
@@ -965,7 +1103,16 @@ public sealed class Poe2Live
                 if (vis || !haveTogglerUi) { togglerUi = new MapUi(vis, sx, sy, zoom); haveTogglerUi = true; }
             }
         }
-        if (!any) return default;
+        if (!any)
+        {
+            // Every cached element stopped reading as a map element: they went stale within the area (the
+            // game rebuilt that UI). Drop them so discovery runs again (throttled above) rather than
+            // reporting "map closed" until the next zone.
+            _mapEls.Clear();
+            _everHidden.Clear();
+            _everVisible.Clear();
+            return default;
+        }
 
         if (sawToggler)
             return new MapUi(togglerVisible, togglerUi.ShiftX, togglerUi.ShiftY, togglerUi.Zoom);
@@ -1518,18 +1665,11 @@ public sealed class Poe2Live
 
     private Vector3? EntityWorld(nint entity)
     {
-        if (!_renderAddr.TryGetValue(entity, out var render))
-        {
-            render = ResolveComponent(entity, "Render");
-            _renderAddr[entity] = render; // cache even if 0, to avoid re-walking
-        }
+        var render = CachedComponent(_renderAddr, entity, "Render"); // absent is cached as 0 → not re-walked
         if (render == 0) return null;
         if (!_reader.TryReadStruct<Vector3>(render + Poe2.Render.CurrentWorldPosition, out var w)) return null;
         return w;
     }
-
-    private System.Numerics.Vector2? EntityGrid(nint entity)
-        => EntityWorld(entity) is { } w ? new System.Numerics.Vector2(w.X / Poe2.WorldToGridRatio, w.Y / Poe2.WorldToGridRatio) : null;
 
     /// <summary>Chest opened state. The 2026-06-06 patch INVERTED this flag: Chest +0x168 is now 0
     /// while closed/openable and non-zero once opened/used (was the reverse). Validated live by diffing
@@ -1538,7 +1678,7 @@ public sealed class Poe2Live
     /// than silently hiding a real one — which is exactly the bug this flip caused.</summary>
     private bool ReadChestOpened(nint entity)
     {
-        if (!_chestAddr.TryGetValue(entity, out var c)) { c = ResolveComponent(entity, "Chest"); _chestAddr[entity] = c; }
+        var c = CachedComponent(_chestAddr, entity, "Chest");
         if (c == 0) return false;
         return _reader.TryReadStruct<byte>(c + Poe2.ChestComponent.OpenState, out var b) && b != 0;
     }
@@ -1558,6 +1698,9 @@ public sealed class Poe2Live
     {
         if (_category.TryGetValue(entity, out var c)) return c;
         var meta = ReadMetadata(entity);
+        // Every entity has a metadata path, so an empty one is a failed read — don't freeze it as "Other"
+        // with no name for the entity's lifetime; retry on later passes (bounded).
+        if (meta.Length == 0 && RetryLater(entity)) return EntityCategory.Other;
         _meta[entity] = meta;
         c = meta switch
         {
@@ -1606,29 +1749,43 @@ public sealed class Poe2Live
     /// <summary>Resolve a component address by name via EntityDetails → ComponentLookUp (StdBucket) → ComponentList.</summary>
     private nint ResolveComponent(nint entity, string name)
     {
+        TryResolveComponent(entity, name, out var comp);
+        return comp;
+    }
+
+    /// <summary><see cref="ResolveComponent"/> that also says whether the answer is TRUSTWORTHY. Returns
+    /// true with the component address, or true with 0 when the whole lookup table was read and the
+    /// entity simply has no such component. Returns false (address 0) when something on the way could not
+    /// be read — the entity may be mid-construction — so callers must not cache that as "absent".</summary>
+    private bool TryResolveComponent(nint entity, string name, out nint comp)
+    {
+        comp = 0;
         var details = Ptr(entity + Poe2.Entity.EntityDetailsPtr);
-        if (details == 0) return 0;
+        if (details == 0) return false;
         var lookup = Ptr(details + Poe2.EntityDetails.ComponentLookUpPtr);
-        if (lookup == 0) return 0;
-        if (!_reader.TryReadStruct<StdVector>(entity + Poe2.Entity.ComponentList, out var compList)) return 0;
+        if (lookup == 0) return false;
+        if (!_reader.TryReadStruct<StdVector>(entity + Poe2.Entity.ComponentList, out var compList)) return false;
         var compCount = ((long)compList.Last - (long)compList.First) / 8;
-        if (compCount is <= 0 or > 256) return 0;
+        if (compCount is <= 0 or > 256) return false;
 
         var bFirst = Ptr(lookup + Poe2.ComponentLookUp.NameAndIndexBucket);
-        if (!_reader.TryReadStruct<nint>(lookup + Poe2.ComponentLookUp.NameAndIndexBucket + 8, out var bLast)) return 0;
+        if (!_reader.TryReadStruct<nint>(lookup + Poe2.ComponentLookUp.NameAndIndexBucket + 8, out var bLast)) return false;
         var entries = ((long)bLast - (long)bFirst) / Poe2.ComponentLookUp.EntryStride;
-        if (bFirst == 0 || entries is <= 0 or > 256) return 0;
+        if (bFirst == 0 || entries is <= 0 or > 256) return false;
 
+        var complete = true;   // false if any entry couldn't be READ (so "not found" isn't conclusive)
         for (long i = 0; i < entries; i++)
         {
             var e = bFirst + (nint)(i * Poe2.ComponentLookUp.EntryStride);
-            var namePtr = Ptr(e);
-            if (!_reader.TryReadStruct<int>(e + 8, out var index)) continue;
+            if (!_reader.TryReadStruct<nint>(e, out var namePtr) || !_reader.TryReadStruct<int>(e + 8, out var index))
+            { complete = false; continue; }
             if (index < 0 || index >= compCount) continue;
+            if ((ulong)namePtr < 0x10000 || (ulong)namePtr > 0x7FFFFFFFFFFF) continue;
             if (_reader.ReadStringUtf8(namePtr, 32) != name) continue;
-            return Ptr(compList.First + (nint)(index * 8));
+            comp = Ptr(compList.First + (nint)(index * 8));
+            return comp != 0;
         }
-        return 0;
+        return complete;
     }
 
     /// <summary>Read an entity's metadata path: EntityDetails(+0x08) → name StdWString(+0x08).</summary>
@@ -1639,13 +1796,8 @@ public sealed class Poe2Live
         return ReadStdWString(details + Poe2.EntityDetails.Name);
     }
 
-    private string ReadStdWString(nint addr)
-    {
-        if (!_reader.TryReadStruct<int>(addr + 0x10, out var len) || len <= 0 || len > 1024) return string.Empty;
-        if (len < 8) return _reader.ReadStringUtf16(addr, len);
-        var ptr = Ptr(addr);
-        return ptr == 0 ? string.Empty : _reader.ReadStringUtf16(ptr, len);
-    }
+    // Inline-vs-heap is decided by the wstring's CAPACITY, not its length — see MemoryReader.ReadStdWString.
+    private string ReadStdWString(nint addr) => _reader.ReadStdWString(addr, 1024);
 
     /// <summary>Safe pointer read: 0 on failure or implausible (non-user-mode) value.</summary>
     private nint Ptr(nint addr)

@@ -114,7 +114,7 @@ public sealed class DisplayRules
     {
         lock (_gate)
         {
-            _rules = rules.ToList();
+            _rules = rules.Where(r => r is not null).ToList();   // a null entry would throw in Compiled
             Rebuild(); Save();
         }
     }
@@ -298,7 +298,8 @@ public sealed class DisplayRules
         {
             if (!File.Exists(_filePath)) return;
             var list = JsonSerializer.Deserialize<List<DisplayRule>>(File.ReadAllText(_filePath), Json);
-            if (list != null) _rules = list;
+            // Skip JSON null entries (a hand-edited "[null, …]") — one would throw in Rebuild and abort startup.
+            if (list != null) _rules = list.Where(r => r is not null).ToList();
         }
         catch (Exception ex) { Console.Error.WriteLine($"Display rules load failed: {ex.Message}"); }
     }
@@ -307,9 +308,7 @@ public sealed class DisplayRules
     {
         try
         {
-            var dir = Path.GetDirectoryName(_filePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(_filePath, JsonSerializer.Serialize(_rules, Json));
+            AtomicFile.WriteAllText(_filePath, JsonSerializer.Serialize(_rules, Json));
         }
         catch (Exception ex) { Console.Error.WriteLine($"Display rules save failed: {ex.Message}"); }
     }

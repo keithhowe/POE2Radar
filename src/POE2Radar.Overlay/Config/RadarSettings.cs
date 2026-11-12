@@ -320,18 +320,57 @@ public sealed class RadarSettings
         return changed;
     }
 
-    /// <summary>Persist current settings to disk. Never throws on IO error — logs and continues.</summary>
+    // Save() is called from the render thread (hotkeys / overlay clicks), the world thread (one-time
+    // seeds) and the HTTP thread (dashboard edits). One writer at a time, so two saves can't collide on
+    // the file (the loser used to hit a sharing violation and be dropped).
+    private static readonly object SaveGate = new();
+
+    /// <summary>Persist current settings to disk. Never throws on IO error — logs and continues.
+    /// Serialized under a lock and written atomically (temp file + rename), so a crash or a concurrent
+    /// save can never leave a truncated file that would reset every setting to defaults on next launch.</summary>
     public void Save()
     {
         try
         {
-            var dir = Path.GetDirectoryName(FilePath);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, Json));
+            lock (SaveGate)
+            {
+                string json;
+                try { json = JsonSerializer.Serialize(this, Json); }
+                // Another thread mutated one of the lists mid-enumeration (settings objects aren't
+                // locked for edits) — the second pass sees the settled state.
+                catch (InvalidOperationException) { json = JsonSerializer.Serialize(this, Json); }
+                AtomicFile.WriteAllText(FilePath, json);
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Settings save failed: {ex.Message}");
+        }
+    }
+}
+
+/// <summary>
+/// Crash-safe replacement for <c>File.WriteAllText</c> used by every JSON store: the content is written
+/// to a sibling temp file and then renamed over the target, so the target is always either the complete
+/// old file or the complete new one — never a truncated mix. Creates the directory if needed. Callers
+/// must serialize their own writes to a given path (each store already saves under its own lock).
+/// </summary>
+internal static class AtomicFile
+{
+    public static void WriteAllText(string path, string contents)
+    {
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        var tmp = path + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, contents);
+            File.Move(tmp, path, overwrite: true);   // same directory → an atomic rename on NTFS
+        }
+        catch
+        {
+            try { File.Delete(tmp); } catch { /* best effort — the next save overwrites it */ }
+            throw;
         }
     }
 }
