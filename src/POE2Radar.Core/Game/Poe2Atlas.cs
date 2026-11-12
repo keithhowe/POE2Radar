@@ -509,12 +509,15 @@ public sealed class Poe2Atlas
     /// defaults only when the full map/content set is available.</summary>
     public bool AllTagsResolved { get; private set; }
 
-    /// <summary>True when <see cref="Poe2.AtlasNode.Content"/> is a field of its own. On the current build
-    /// the committed offset is the SAME slot as <see cref="Poe2.AtlasNode.GridPos"/> (the content-row pointer
-    /// was repurposed — see the offset table), so it must not be read as content or dereferenced as a row.
-    /// Derived from the offset table rather than hard-coded, so re-pointing Content (source or offsets.json)
-    /// once the real field is re-discovered switches the content-row reads back on with no code change.</summary>
-    private static bool ContentSlotValid => Poe2.AtlasNode.Content != Poe2.AtlasNode.GridPos;
+    /// <summary>True when <see cref="Poe2.AtlasNode.Content"/> may be read as the content-row pointer. It
+    /// must be a field of its own — while the committed offset is the SAME slot as
+    /// <see cref="Poe2.AtlasNode.GridPos"/> (2026-09-05 build) it would report GridX as "content".
+    /// <para>It is ALSO gated on the explicit <see cref="Poe2.AtlasNode.ContentRowValid"/> switch: after the
+    /// 2026-11 patch GridPos moved off this slot again, but what +0x310 now holds is a per-node pointer
+    /// that has NOT been re-validated as the content row (ContentVec reads empty on every node), so "not
+    /// aliasing GridPos" alone is no longer evidence the slot is content.</para></summary>
+    private static bool ContentSlotValid
+        => Poe2.AtlasNode.ContentRowValid != 0 && Poe2.AtlasNode.Content != Poe2.AtlasNode.GridPos;
 
     private void Invalidate() { _nodeCanvas = 0; _nodeVtable = 0; _hiddenTicks = 0; _tagCache.Clear(); _graph.Clear(); _graphCanvas = 0; _graphBegin = 0; _graphEnd = 0; _currentMarker = 0; }
 
@@ -527,6 +530,7 @@ public sealed class Poe2Atlas
     {
         lock (_nodeLock)
         {
+            if (Poe2.AtlasGraph.CurrentMarkerValid == 0) return null;       // field not validated on this build
             var m = _currentMarker;
             if (m == 0 || Ptr(m + Poe2.UiElement.Self) != m) return null;   // not located / stale
             var node = Ptr(m + Poe2.AtlasGraph.CurrentMarkerNodePtr);

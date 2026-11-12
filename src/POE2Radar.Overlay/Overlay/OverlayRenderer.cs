@@ -177,9 +177,9 @@ public sealed class OverlayRenderer : IDisposable
                 DrawAtlas(rt, ctx);                        // tracked-map rings + off-screen arrows
                 _legendRowRects.Clear();
             }
-            else if (ctx.Active && ctx.InGame)
+            else if (ctx.Active && ctx.InGame && !ctx.HideRadar)
             {
-                DrawNameplates(rt, ctx);                   // world-space HP bars over hostile mobs
+                DrawNameplates(rt, ctx);                  // world-space HP bars over hostile mobs
                 DrawItemLabels(rt, ctx);                   // priced unique drops over their loot icons
                 if (ctx.Map.IsVisible)
                     DrawMap(rt, ctx);                      // terrain + dots + on-map path polylines
@@ -192,7 +192,7 @@ public sealed class OverlayRenderer : IDisposable
             }
             else
             {
-                _legendRowRects.Clear(); // not active/in-game: no stale click rects
+                _legendRowRects.Clear(); // not active/in-game, or radar hidden (hideout): no stale click rects
             }
 
             // Rune-crafting reward prices: screen-space labels drawn on top of whatever's below (radar
@@ -310,6 +310,16 @@ public sealed class OverlayRenderer : IDisposable
                     var carry = spacing * phase;   // reset per segment so the phase is honoured on every edge
                     DrawAtlasChevrons(rt, a, b, col, chevron, spacing, ref carry);
                 }
+                // START disc on the route's first node — the runnable map this route begins from. Routes start
+                // at the runnable frontier, not at the player, so without this there is no way to tell which
+                // end of a line to run first. (Shared starts just overdraw the same disc.)
+                var src = pts[0];
+                if (On(src, 0f))
+                {
+                    _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(src, 7f, 7f), _bStyle, 4f);
+                    _bStyle.Color = green; rt.DrawEllipse(new Ellipse(src, 7f, 7f), _bStyle, 2.5f);
+                    rt.FillEllipse(new Ellipse(src, 2.5f, 2.5f), _bStyle);
+                }
                 // Hop-count chip at the target end (only when the target is on-screen).
                 var tgt = pts[^1];
                 if (On(tgt, 0f))
@@ -355,10 +365,35 @@ public sealed class OverlayRenderer : IDisposable
         if (current is { } cur)
         {
             var p = Proj(cur);
-            _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(p, 11f, 11f), _bStyle, 4.5f);
-            _bStyle.Color = new Color4(0.3f, 0.95f, 1f, 1f);
-            rt.DrawEllipse(new Ellipse(p, 11f, 11f), _bStyle, 2.5f);
-            rt.FillEllipse(new Ellipse(p, 3f, 3f), _bStyle);
+            var youCol = new Color4(0.3f, 0.95f, 1f, 1f);
+            if (On(p, 0f))
+            {
+                _bStyle!.Color = new Color4(0f, 0f, 0f, 0.7f); rt.DrawEllipse(new Ellipse(p, 16f, 16f), _bStyle, 5.5f);
+                _bStyle.Color = youCol;
+                rt.DrawEllipse(new Ellipse(p, 16f, 16f), _bStyle, 3f);
+                rt.DrawEllipse(new Ellipse(p, 9f, 9f), _bStyle, 1.5f);
+                rt.FillEllipse(new Ellipse(p, 3.5f, 3.5f), _bStyle);
+                // Labelled, because a bare ring reads as just another highlight among the tracked-map rings.
+                rt.FillRectangle(new Vortice.RawRectF(p.X - 17f, p.Y + 19f, p.X + 17f, p.Y + 35f), _bPanel!);
+                rt.DrawText("YOU", _tf!, Rect.FromLTRB(p.X - 11f, p.Y + 19f, p.X + 17f, p.Y + 35f), _bStyle, DrawTextOptions.Clip);
+            }
+            else
+            {
+                // Off-screen: a "YOU" chip pinned to the screen edge in its direction, so you can pan to it.
+                var c = new NumVec2(W * 0.5f, H * 0.5f);
+                var d = p - c; var len = d.Length();
+                if (len > 1f && float.IsFinite(len))
+                {
+                    d /= len;
+                    float tx = d.X != 0 ? ((d.X > 0 ? W - 40f : 40f) - c.X) / d.X : float.MaxValue;
+                    float ty = d.Y != 0 ? ((d.Y > 0 ? H - 30f : 30f) - c.Y) / d.Y : float.MaxValue;
+                    var e2 = c + d * MathF.Min(tx, ty);
+                    rt.FillRectangle(new Vortice.RawRectF(e2.X - 22f, e2.Y - 9f, e2.X + 22f, e2.Y + 9f), _bPanel!);
+                    _bStyle!.Color = youCol;
+                    rt.DrawRectangle(new Vortice.RawRectF(e2.X - 22f, e2.Y - 9f, e2.X + 22f, e2.Y + 9f), _bStyle, 1.5f);
+                    rt.DrawText("YOU", _tf!, Rect.FromLTRB(e2.X - 11f, e2.Y - 8f, e2.X + 22f, e2.Y + 9f), _bStyle, DrawTextOptions.Clip);
+                }
+            }
         }
     }
 

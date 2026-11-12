@@ -628,10 +628,16 @@ public static class Poe2
     {
         public static readonly int MapNodeId   = OffsetOverrides.Get("AtlasNode.MapNodeId", 0x300); // ✓ u32 — distinct per node
         public static readonly int Content     = OffsetOverrides.Get("AtlasNode.Content", 0x310); // ⚠ 2026-09-05 league patch: this slot is now GridPos, NOT a content-row ptr. Do not read as content.
+        // 0 = do NOT read Content as the content-row pointer (the default: not re-validated since the slot was
+        // repurposed). 2026-11-11: +0x310 holds a distinct per-node pointer on 379/925 nodes and ContentVec
+        // (+0x350) is empty on all 925 (--atlas-content), so rolled content (Breach/Delirium/…) is UNRESOLVED
+        // on this build; only the badge path still yields tags. Set to 1 (source or offsets.json) once
+        // --atlas-content / --atlas-resolve confirm where the row lives.
+        public static readonly int ContentRowValid = OffsetOverrides.Get("AtlasNode.ContentRowValid", 0);
         public static readonly int State       = OffsetOverrides.Get("AtlasNode.State", 0x32C); // (community) u8 state (seen =1 on loaded nodes)
         public static readonly int Biome       = OffsetOverrides.Get("AtlasNode.Biome", 0x32E); // ⚠ 2026-09-05 league patch: NO LONGER a 0..12 biome index (byte scatter 0..255); no biome-shaped field found on the node or its data struct. Unresolved — do not rely on it.
         public static readonly int Flags       = OffsetOverrides.Get("AtlasNode.Flags", 0x32F); // (community) u8: bit0 unlocked, bit1 visited
-        public static readonly int GridPos     = OffsetOverrides.Get("AtlasNode.GridPos", 0x310); // ✓ live 2026-09-05 — StdTuple2D<int> X[-48..31] Y[16..127], the node-graph key; 1:1 with node. 2026-09-05 league patch: was 0x320.
+        public static readonly int GridPos     = OffsetOverrides.Get("AtlasNode.GridPos", 0x320); // ✓ live 2026-11-11 (--atlas-nodescan/--atlas-graph: 925/925 distinct, X[-32..95] Y[-32..31]) — 2026-11 patch moved it BACK +0x10 (was 0x310 since 2026-09-05). Earlier: StdTuple2D<int> X[-48..31] Y[16..127], the node-graph key; 1:1 with node. 2026-09-05 league patch: was 0x320.
         public static readonly int Completion  = OffsetOverrides.Get("AtlasNode.Completion", 0x339); // (community) u8 per-node completion id
         public static readonly int ContentVec  = OffsetOverrides.Get("AtlasNode.ContentVec", 0x350); // (community) StdVector begin (content list); End @ +0x358
 
@@ -644,7 +650,7 @@ public static class Poe2
         public static readonly int DataStorage = OffsetOverrides.Get("AtlasNode.DataStorage", 0x10);   // *(node+0x10) → storage
         public static readonly int DataModel   = OffsetOverrides.Get("AtlasNode.DataModel", 0x20);   // *(storage+0x20) → nodeData
         public static readonly int DataBiome   = OffsetOverrides.Get("AtlasNode.DataBiome", 0x2CE);  // u8 within nodeData
-        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2CF);  // ✓ live 2026-09-14/15 (Research --atlas-statusscan, 2008 nodes) — u8 ENUM, not a bitfield:
+        public static readonly int DataStatus  = OffsetOverrides.Get("AtlasNode.DataStatus", 0x2E3);  // ✓ live 2026-11-11 (--atlas-statusscan: revealed {0=x56 1=x8 255=x773}, fogged {255=x88}; adjacency test 38/41 neighbours of completed read 255) — 2026-11 patch +0x14 (was 0x2CF, which now reads 0..23 scatter). The sibling offsets below (0x2CB/0x2CE/0x2D0) are NOT re-verified for this build. Earlier: live 2026-09-14/15 (Research --atlas-statusscan, 2008 nodes) — u8 ENUM, not a bitfield:
                                                //   0 = COMPLETED (256 nodes on a lvl-91 char), 1 = seen on 19 nodes but NOT runnable (see StatusOne;
                                                //   RUNNABLE is not stored — Poe2Atlas derives it from graph adjacency to a completed map), 255 = no state.
                                                // Decoding it as bits (bit0 accessible, bit1 completed) read 255 as "accessible AND completed",
@@ -683,7 +689,14 @@ public static class Poe2
         /// accessor is structural, not vtable-keyed (the marker's class drifts per patch), so it's found by
         /// "the lone non-node element whose +0x300 ∈ node set". <c>currentNode = *(marker + 0x300)</c>, then
         /// read the node's <see cref="AtlasNode.GridPos"/>. Re-discover with <c>--atlas-marker</c>.</summary>
-        public static readonly int CurrentMarkerNodePtr = OffsetOverrides.Get("AtlasGraph.CurrentMarkerNodePtr", 0x2E8); // ✓ live 2026-09-05. 2026-09-05 league patch: was 0x300.
+        // 0 = do NOT trust CurrentMarkerNodePtr (the default). 2026-11-11: on the 2026-11 build the element
+        // found through +0x2E8 follows the HOVERED tile — its target changed (7,-3) → (-28,-8) between two
+        // reads with the player standing in a hideout — and --atlas-marker finds no element at +0x300
+        // either. The overlay derives "you are here" from the last map run instead (RadarApp
+        // ResolveLastMapGrid). Set to 1 (source or offsets.json) once --atlas-marker / --atlas-findcur
+        // re-validate the field.
+        public static readonly int CurrentMarkerValid = OffsetOverrides.Get("AtlasGraph.CurrentMarkerValid", 0);
+        public static readonly int CurrentMarkerNodePtr =OffsetOverrides.Get("AtlasGraph.CurrentMarkerNodePtr", 0x2E8); // ✓ live 2026-09-05. 2026-09-05 league patch: was 0x300.
     }
 
     /// <summary>Atlas screen panel — a PERSISTENT direct child of UiRoot (the element at
@@ -698,7 +711,7 @@ public static class Poe2
     /// the shallowest stable path). <see cref="ExpectedChildCount"/> is a secondary signature (18 children).</summary>
     public static class AtlasPanel
     {
-        public static readonly int UiRootChildIndex  = OffsetOverrides.Get("AtlasPanel.UiRootChildIndex", 22); // ✓ live 2026-06-08 — stable across a cold restart
+        public static readonly int UiRootChildIndex  = OffsetOverrides.Get("AtlasPanel.UiRootChildIndex", 21); // ✓ live 2026-11-11 (--atlas-probe ancestor chain: node canvas → … → UiRoot child[21], 18 children, visible with the Atlas open) — 2026-11 patch -1 (child[22] is now a 3-child panel). Earlier: 22, live 2026-06-08 — stable across a cold restart
         public static readonly int ExpectedChildCount = OffsetOverrides.Get("AtlasPanel.ExpectedChildCount", 18); // ✓ signature (panel had 18 children closed + open)
     }
 

@@ -640,6 +640,13 @@ internal static class AtlasGates
         var atlas = new Poe2Atlas(reader);
         var nodes = atlas.ReadNodes(igs);
         Console.WriteLine($"\nGATE2/3 Poe2Atlas.ReadNodes -> {nodes.Count} nodes");
+        if (nodes.Count == 0)
+        {
+            // Nothing to summarise (Min/Max below throw on an empty list) — say why instead of crashing.
+            Console.WriteLine("      (0 nodes — if GATE1 shows the committed index is not a visible panel, that is the blocker;");
+            Console.WriteLine("       if GATE1 passes, the node-class detection failed or the Atlas is closed)");
+            return 0;
+        }
         var vis = nodes.Where(x => x.Visible).ToList();
         var named = nodes.Count(x => !string.IsNullOrEmpty(x.MapCode));
         Console.WriteLine($"      visible={vis.Count}/{nodes.Count}   with MapCode={named}/{nodes.Count}");

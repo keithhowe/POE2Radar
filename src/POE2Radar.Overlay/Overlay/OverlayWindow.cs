@@ -188,8 +188,12 @@ public sealed class OverlayWindow : IDisposable
     }
 
     /// <summary>Create the DC render target (not yet bound to a DC). 96 DPI ⇒ 1 DIP == 1 device pixel, so
-    /// renderer coordinates are physical pixels of the DIB — the same space as the game's client rect
-    /// (the process is per-monitor DPI aware, so every Win32 rect we read is physical pixels too).</summary>
+    /// renderer coordinates are pixels of the DIB — the same space as the game's client rect as THIS
+    /// process sees it. The process is deliberately NOT DPI-aware: on a scaled monitor Windows hands us
+    /// virtualized (smaller) rects and stretches the overlay, which costs sharpness but keeps the
+    /// per-frame clear + UpdateLayeredWindow blit small. Measured on 3840x2160 @ 150%: per-monitor
+    /// awareness (full-resolution DIB) took ~14 ms/frame (72 fps) vs ~5-8 ms (135-142 fps) without it.
+    /// Every projection is proportional to Width/Height, so alignment holds either way.</summary>
     private void CreateRenderTarget()
     {
         // ID2D1DCRenderTarget renders into whatever DC we BindDC to.
@@ -342,8 +346,8 @@ public sealed class OverlayWindow : IDisposable
     /// only coincide in borderless mode: in a captioned window the window rect also covers the title bar
     /// and the resize borders, which would shift and stretch everything. Returns false, keeping the
     /// previous size and position, when the game window is minimized or has no client area — the overlay
-    /// is never reallocated to a minimized window's stub rect. (Per-monitor DPI aware process ⇒ these are
-    /// physical pixels, same as the DIB.)
+    /// is never reallocated to a minimized window's stub rect. (Same coordinate space as the DIB and the
+    /// cursor reads — see <see cref="CreateRenderTarget"/> for why the process is not DPI-aware.)
     /// </summary>
     public bool TrackGameWindow(nint gameHwnd)
     {

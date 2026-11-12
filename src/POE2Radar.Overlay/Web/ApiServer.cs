@@ -530,6 +530,7 @@ public sealed class ApiServer : IDisposable
         showMonsters = _settings.ShowMonsters,
         showTerrain = _settings.ShowTerrain,
         showPlayerBlip = _settings.ShowPlayerBlip,
+        hideInHideout = _settings.HideInHideout,
         labelDeclusterPx = _settings.LabelDeclusterPx,
         fpsCap = _settings.FpsCap,
         hpBarNormal = _settings.HpBarNormal,
@@ -594,6 +595,7 @@ public sealed class ApiServer : IDisposable
                 case "showMonsters" when TryBool(p.Value, out var b): _settings.ShowMonsters = b; applied.Add(p.Name); break;
                 case "showTerrain" when TryBool(p.Value, out var b): _settings.ShowTerrain = b; applied.Add(p.Name); break;
                 case "showPlayerBlip" when TryBool(p.Value, out var b): _settings.ShowPlayerBlip = b; applied.Add(p.Name); break;
+                case "hideInHideout" when TryBool(p.Value, out var b): _settings.HideInHideout = b; applied.Add(p.Name); break;
                 // 0 (or less) = AUTO: match the monitor the game is on (RadarSettings.FpsCap); else a fixed cap.
                 case "fpsCap" when TryInt(p.Value, out var n): _settings.FpsCap = n <= 0 ? 0 : Math.Clamp(n, 15, 360); applied.Add(p.Name); break;
                 case "hpBarNormal" when TryBool(p.Value, out var b): _settings.HpBarNormal = b; applied.Add(p.Name); break;

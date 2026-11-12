@@ -29,6 +29,10 @@ public sealed class RadarSettings
     public bool ShowTerrain { get; set; } = true;
     // The player position blip at map-center. Default on (prior behavior); some prefer it off.
     public bool ShowPlayerBlip { get; set; } = true;
+    // Hide the world radar (terrain, dots, HP bars, routes, the nav-menu chip) while in a hideout — there
+    // is nothing to navigate to there. The atlas overlay and the price chips (hover / stash / exchange)
+    // still draw, since the hideout is exactly where those are used. Default on.
+    public bool HideInHideout { get; set; } = true;
 
     // ── Entity-label declustering. Several entities matching the SAME display rule within this many
     //    SCREEN pixels collapse to one label drawn "Name xN"; every dot is still drawn, only the text
@@ -136,6 +140,11 @@ public sealed class RadarSettings
     public List<AtlasMapGroup> AtlasGroups { get; set; } = new();
     public bool AtlasGroupsSeeded { get; set; }
 
+    // "You are here" on the atlas: the area code of the last map the player was in ("MapBloomingField")
+    // and the atlas node ("x,y" grid, "" = not resolved yet) it was matched to. Maintained by the overlay.
+    public string AtlasLastMapCode { get; set; } = "";
+    public string AtlasLastMapGrid { get; set; } = "";
+
     // One-time guard: false until the default "Abyss Lightless (Void)" monster display rule has been
     // seeded into display_rules.json. Set true after seeding so a user who deletes the rule keeps it gone.
     public bool AbyssRuleSeeded { get; set; }
@@ -157,6 +166,9 @@ public sealed class RadarSettings
     // One-time guard: broadens the ground-item category set from the old {Uniques,Runes,Essences,Currency}
     // to the full high-value set, now that non-uniques actually price + draw.
     public bool GroundDefaultsV2 { get; set; }
+    // One-time: MinQuantity changed meaning (see GroundItemSettings.MinQuantity) — move a config still on
+    // the old default of 2 to the new default.
+    public bool PriceConfidenceV2 { get; set; }
     // One-time guard: bumps the monster Magic/Rare/Unique rule sizes — the detailed Fang/Claw/Skull glyphs
     // need ~1.5× the size the old flat shapes used to be legible at radar scale.
     public bool IconSizesV1 { get; set; }
@@ -521,7 +533,14 @@ public sealed class GroundItemSettings
     // SHARED pricing-confidence threshold (ground overlay + hover): a price backed by a positive-but-lower
     // listing count is FLAGGED with a "?" suffix rather than hidden, so a possible mislisting still shows but
     // reads as uncertain. A reported volume of 0 = "no volume data" (many legit fungibles), never flagged.
-    public int MinQuantity { get; set; } = 2;
+    // 2026-11: the count is now UNITS TRADED (exchange items) / listing count (uniques) — see PriceBook.
+    // The old value was poe.ninja's divine-denominated volume truncated to an int, which read 0 ("no
+    // data, trusted") for exactly the thinnest markets. 0 = never judge.
+    public int MinQuantity { get; set; } = 10;
+    // What to do with a low-confidence price on the things the overlay volunteers (ground loot, loot
+    // tags, monolith / ritual / rune rewards): true = don't show a value at all, false = show it with a
+    // "?". The hover price always shows with a "?" — hovering is an explicit ask.
+    public bool HideLowConfidence { get; set; } = true;
     public string League { get; set; } = "";             // SHARED price league (ground + hover); blank = auto-detect current league
     // Draw the value chip ON the game's own loot tag (game-computed rect → no projection, no jitter) for
     // everything the game already names (currency/runes/essences/fragments/identified uniques), matched by

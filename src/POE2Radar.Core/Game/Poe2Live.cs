@@ -162,10 +162,12 @@ public sealed class Poe2Live
         return h;
     }
 
-    /// <summary>Monster/area level (validated live: 27, 32).</summary>
+    /// <summary>Monster/area level (validated live: 27, 32). The level is the LOW BYTE of this slot: the
+    /// bytes above it are not always zero — an HC SSF character in G1_1 read 0x0101 (257) as an int, which
+    /// level-gated every monolith recipe out. Area levels are well under 256, so one byte is the field.</summary>
     public int AreaLevel(nint areaInstance)
     {
-        _reader.TryReadStruct<int>(areaInstance + Poe2.AreaInstance.CurrentAreaLevel, out var l);
+        _reader.TryReadStruct<byte>(areaInstance + Poe2.AreaInstance.CurrentAreaLevel, out var l);
         return l;
     }
 
@@ -1016,6 +1018,24 @@ public sealed class Poe2Live
         var rows = (int)(totalBytes / bytesPerRow);
         var width = bytesPerRow * 2;
         if (rows <= 0 || rows > 65536) return null;
+
+        // The grid is tilesX×tilesY tiles of TileGridCells cells, packed two cells per byte — so when the
+        // real width is ODD the last byte of every row carries one PADDING nibble, and it is not zero
+        // (live, MapBloomingField: 75 tiles → 1725 cells, BytesPerRow 863 → 1726 decoded, column 1725
+        // non-zero on all 1863 rows). Decoded as a cell it is a full-height "walkable" column: one straight
+        // edge line across the overlay on every odd-width map, and a phantom corridor for the pathfinder.
+        // Clamp to the real dimensions when the tile counts read sanely.
+        if (_reader.TryReadStruct<long>(terrain + Poe2.Terrain.TotalTiles, out var tilesX)
+            && _reader.TryReadStruct<long>(terrain + Poe2.Terrain.TotalTiles + 8, out var tilesY)
+            && tilesX > 0 && tilesY > 0 && tilesX < 4096 && tilesY < 4096)
+        {
+            var realW = (int)(tilesX * Poe2.Terrain.TileGridCells);
+            var realH = (int)(tilesY * Poe2.Terrain.TileGridCells);
+            // Only ever trim the packing slack (at most one nibble per row / a few trailing rows) — a tile
+            // count that disagrees by more than that means one of the two reads is wrong, so leave it.
+            if (realW < width && width - realW <= 1) width = realW;
+            if (realH < rows && rows - realH <= Poe2.Terrain.TileGridCells) rows = realH;
+        }
 
         var raw = new byte[totalBytes];
         if (_reader.TryReadBytes(first, raw) != raw.Length) return null;

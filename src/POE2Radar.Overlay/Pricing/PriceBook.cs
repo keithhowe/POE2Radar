@@ -6,12 +6,13 @@ namespace POE2Radar.Overlay.Pricing;
 
 /// <summary>
 /// Result of a price lookup. <see cref="Exalted"/> is the item's value in Exalted Orbs (PoE2's base
-/// economy unit). <see cref="Quantity"/> is the listing count / trade volume — a confidence signal:
-/// low-volume rows are often mislisted (a 2-listing leveling unique priced at 5000 div).
+/// economy unit). <see cref="Quantity"/> is the confidence signal: for exchange items (currency, runes,
+/// gems…) the approximate number of UNITS traded, for uniques the listing count, and -1 when the source
+/// gave neither. Thin rows are often mislisted (a 2-listing leveling unique priced at 5000 div).
 /// </summary>
 public readonly record struct PriceResult(string Name, double Exalted, int Quantity, string Category)
 {
-    public bool LowConfidence(int minQty) => Quantity < minQty;
+    public bool LowConfidence(int minQty) => Quantity >= 0 && Quantity < minQty;   // -1 = unknown, not judged
 }
 
 /// <summary>
@@ -140,10 +141,23 @@ public sealed class PriceBook
     /// league" — the last known league is kept, so a transient blank can't cause a refetch storm.</summary>
     public void SetDetectedLeague(string? league)
     {
-        var v = string.IsNullOrWhiteSpace(league) ? null : league.Trim();
+        var v = string.IsNullOrWhiteSpace(league) ? null : TradeLeague(league.Trim());
         if (v == null || v == _detectedLeague) return;
         _detectedLeague = v;
         if (_leagueOverride == null) LeagueRequestChanged(); // only matters when auto-detecting
+    }
+
+    /// <summary>Map an in-game league name to the league that actually has a market. Solo Self-Found
+    /// leagues have no trade economy, so poe.ninja publishes nothing for them ("HC SSF Forbidden Rites"
+    /// returned no rows, live) — price an SSF character against its parent trade league instead:
+    /// "HC SSF X" → "HC X", "SSF X" → "X". Anything without a standalone "SSF" token is returned as-is.
+    /// (A manual league override in settings is never rewritten.)</summary>
+    internal static string TradeLeague(string league)
+    {
+        var parts = league.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (!parts.Any(p => p.Equals("SSF", StringComparison.OrdinalIgnoreCase))) return league;
+        var kept = string.Join(' ', parts.Where(p => !p.Equals("SSF", StringComparison.OrdinalIgnoreCase)));
+        return kept.Length > 0 ? kept : league;
     }
 
     /// <summary>The league we price against just changed: make the next <see cref="RefreshIfDue"/> fetch
@@ -447,8 +461,16 @@ public sealed class PriceBook
             var id = ln.Id.GetString();
             if (string.IsNullOrEmpty(id) || !meta.TryGetValue(id, out var m)) continue;
             if (string.IsNullOrWhiteSpace(m.Name) || ln.PrimaryValue <= 0) continue;
-            var ex = ln.PrimaryValue * rate;
-            var qty = (int)Math.Clamp(ln.VolumePrimaryValue ?? 0, 0, int.MaxValue);
+            // The Exalted Orb is the unit itself: exactly 1, not 0.99994 from the rounded divine rate (which
+            // fell just under a 1 ex display floor and hid its own chip).
+            var ex = id == "exalted" ? 1.0 : ln.PrimaryValue * rate;
+            // CONFIDENCE = approximate UNITS traded. poe.ninja reports volume in the primary currency (divines'
+            // worth), so volume / unit price ≈ how many of the item changed hands. Truncating the divine
+            // volume to an int — the old "quantity" — turned every thin market into 0, and 0 was treated as
+            // "no data, trusted": Regal Shard (0.17 div traded ≈ 3 shards) showed a confident 27.98 ex.
+            // -1 = the response carried no volume at all (unknown, so not judged).
+            var qty = ln.VolumePrimaryValue is { } vol && vol >= 0
+                ? (int)Math.Clamp(Math.Round(vol / ln.PrimaryValue), 0, int.MaxValue) : -1;
             var item = new PricedItem(m.Name.Trim(), ex, qty, type);
             Upsert(byName, Normalize(m.Name), item);
             var art = ArtBasenameFromIcon(m.Image);
@@ -467,7 +489,7 @@ public sealed class PriceBook
         {
             if (string.IsNullOrWhiteSpace(ln.Name) || ln.PrimaryValue <= 0) continue;
             var ex = ln.PrimaryValue * rate;
-            var item = new PricedItem(ln.Name.Trim(), ex, ln.ListingCount ?? 0, type);
+            var item = new PricedItem(ln.Name.Trim(), ex, ln.ListingCount ?? -1, type);   // -1 = no listing count (unknown)
             Upsert(byName, Normalize(ln.Name), item);
             var art = ArtBasenameFromIcon(ln.Icon);
             if (art != null) Upsert(byArt, art, item, preferVolume: true);
@@ -511,6 +533,9 @@ public sealed class PriceBook
         public DateTime FetchedUtc { get; set; }
         public double ExPerDivine { get; set; }
         public double ExPerChaos { get; set; }
+        // 2 = Quantity is units traded / listing count with -1 for unknown. Older caches (0) stored the
+        // divine-denominated volume truncated to an int, which is not comparable — see TryLoadCache.
+        public int QuantityVersion { get; set; }
         public Dictionary<string, PricedItem> ByArt { get; set; } = new();
         public Dictionary<string, PricedItem> ByName { get; set; } = new();
     }
@@ -528,6 +553,14 @@ public sealed class PriceBook
             _byName = new Dictionary<string, PricedItem>(dto.ByName, StringComparer.OrdinalIgnoreCase);
             _league = dto.League;
             _lastFetchUtc = dto.FetchedUtc;
+            if (dto.QuantityVersion < 2)
+            {
+                // Old cache: its quantities mean something else. Keep the prices so something shows right
+                // away, mark every quantity unknown, and refetch immediately instead of waiting out the TTL.
+                foreach (var k in _byArt.Keys.ToList()) _byArt[k] = _byArt[k] with { Quantity = -1 };
+                foreach (var k in _byName.Keys.ToList()) _byName[k] = _byName[k] with { Quantity = -1 };
+                _lastFetchUtc = DateTime.MinValue;
+            }
             if (dto.ExPerDivine > 0) { ExPerDivine = dto.ExPerDivine; _rateKnown = true; }
             if (dto.ExPerChaos > 0) ExPerChaos = dto.ExPerChaos;
             Status = $"cache: {ItemCount} entries for '{_league}'";
@@ -542,6 +575,7 @@ public sealed class PriceBook
             var dto = new CacheDto
             {
                 League = _league, FetchedUtc = _lastFetchUtc, ExPerDivine = ExPerDivine, ExPerChaos = ExPerChaos,
+                QuantityVersion = 2,
                 ByArt = new(_byArt), ByName = new(_byName),
             };
             Config.AtomicFile.WriteAllText(_cachePath, JsonSerializer.Serialize(dto, Json));

@@ -544,6 +544,13 @@ public sealed class RadarApp : IDisposable
             }
             _settings.GroundDefaultsV2 = true; _settings.Save();
         }
+        // One-time: the price-confidence threshold changed unit (divine volume → units traded), so a config
+        // still on the old default would let through exactly the thin markets it is meant to catch.
+        if (!_settings.PriceConfidenceV2)
+        {
+            if (_settings.GroundItems.MinQuantity == 2) _settings.GroundItems.MinQuantity = new GroundItemSettings().MinQuantity;
+            _settings.PriceConfidenceV2 = true; _settings.Save();
+        }
         // One-time: bump monster Magic/Rare/Unique rule sizes — the Fang/Claw/Skull glyphs are far less
         // legible than the old flat shapes at the same radar size. Only retouches a rule still on its OLD
         // default size (within a small epsilon), so a size you've customized is preserved.
@@ -781,6 +788,7 @@ public sealed class RadarApp : IDisposable
         foreach (var r in rewards)
         {
             if (_priceBook.TryByName(r.Name) is not { } pr) continue;     // unknown reward → no label
+            if (Untrusted(pr.Quantity)) continue;                         // too thin a market to state a value
             var count = Math.Max(1, r.Count);
             var totalEx = pr.Exalted * count;
             // Show ONLY the value of the offer itself (full-stack value) — no "N×" count prefix, which
@@ -949,6 +957,7 @@ public sealed class RadarApp : IDisposable
                 ? _priceBook.TryByArt(r.Art)
                 : (r.Name is { Length: > 0 } nm ? _priceBook.TryByName(nm) : null);
             if (pr is not { } p) continue;                       // unknown reward → no label
+            if (Untrusted(p.Quantity)) continue;                 // too thin a market to state a value
             var text = _priceBook.Format(p.Exalted);
             // Value tier (absolute Exalted): ≥5 ex green, <0.5 ex dim red, else amber (same palette as runeforge).
             var color = p.Exalted >= 5.0 ? 0xFF66E066u : p.Exalted < 0.5 ? 0xFFE06666u : 0xFFE6C84Du;
@@ -1009,9 +1018,10 @@ public sealed class RadarApp : IDisposable
             if (pr is not { } p) continue;
             var group = CategoryGroup(p.Category);
             if (!enabled.Contains(group)) continue;          // category group toggled off
-            if (p.Exalted < GroundFloor(group)) continue;    // below this bucket's value floor
-            // Low-listing confidence: a price backed by fewer than MinQuantity live listings is flagged
-            // with a "?" rather than hidden (0 volume = no data, not low confidence — see LowConfidence).
+            if (BelowFloor(p.Exalted, GroundFloor(group))) continue;    // below this bucket's value floor
+            // Low confidence (too few units traded / listings): hidden, or flagged with a "?" when the
+            // user chose to keep seeing them (see LowConfidence / Untrusted).
+            if (Untrusted(p.Quantity)) continue;
             var value = _priceBook.Format(p.Exalted);
             if (LowConfidence(p.Quantity)) value += " ?";
             specs.Add(new LootTagSpec(el, text, value, p.Exalted >= cfg.HighlightMinEx));
@@ -1099,7 +1109,10 @@ public sealed class RadarApp : IDisposable
             double best = 0; var bestName = "";
             foreach (var o in offers)
             {
-                var ex = o.Name.Length > 0 && _priceBook.TryByName(o.Name) is { } pr ? pr.Exalted * Math.Max(1, o.Count) : 0;
+                // A low-confidence price counts as 0: it must not make a monolith look valuable (or pull an
+                // auto-route to it) on the strength of a handful of trades.
+                var ex = o.Name.Length > 0 && _priceBook.TryByName(o.Name) is { } pr && !Untrusted(pr.Quantity)
+                    ? pr.Exalted * Math.Max(1, o.Count) : 0;
                 rewards.Add(new MonolithReward(o.Name.Length > 0 ? o.Name : o.Description, o.Count, ex, o.Size, o.Runes));
                 if (ex > best) { best = ex; bestName = o.Name; }
             }
@@ -1267,6 +1280,12 @@ public sealed class RadarApp : IDisposable
             snap.AreaCode, _charName, snap.CharLevel, _worldMs, _renderMs, mr.Markers, _fps,
             ex.Open, ex.Summary, ex.Offered, ex.Wanted, ex.HaveQty, ex.FillNote);
 
+        // Hideout: hide the world radar (nothing to navigate to). Keyed on the LIVE area code off the render
+        // reader (cached per area), so it flips the frame you arrive rather than a world pass later.
+        // Hideout area codes all start with "Hideout" (e.g. "HideoutSummit").
+        var hideRadar = inGame && _settings.HideInHideout
+            && _liveRender.AreaCode(areaInstance).StartsWith("Hideout", StringComparison.OrdinalIgnoreCase);
+
         var realActive = _gameHwnd != 0 && GetForegroundWindow() == _gameHwnd;
         // "Always show" draws the overlay even when PoE2 isn't focused (for dashboard calibration).
         var drawActive = realActive || _settings.AlwaysShowOverlay;
@@ -1299,6 +1318,7 @@ public sealed class RadarApp : IDisposable
             ShowMonsters: _settings.ShowMonsters,
             ShowTerrain: _settings.ShowTerrain,
             ShowPlayerBlip: _settings.ShowPlayerBlip,
+            HideRadar: hideRadar,
             LabelDeclusterPx: _settings.LabelDeclusterPx,
             HpBarNormal: _settings.HpBarNormal,
             HpBarMagic: _settings.HpBarMagic,
@@ -1395,6 +1415,8 @@ public sealed class RadarApp : IDisposable
         var areaCode = _live.AreaCode(areaInstance);
         var player = _live.PlayerGrid(localPlayer) ?? NumVec2.Zero;
         _worldPlayer = player;   // for off-thread replans (EnqueueReplan)
+        _worldAreaCode = areaCode;
+        TrackLastMap(areaCode, areaHash);   // remembers the last atlas map for the "you are here" marker
 
         // Tick the player's vitals on THIS (world) reader too — not for the flask (that's on the render
         // thread's _liveRender), but for the side effect: it self-heals _live's Health-offset (drift) which
@@ -1681,7 +1703,8 @@ public sealed class RadarApp : IDisposable
             if (lookup is not { } pr) continue;
             var group = CategoryGroup(pr.Category);
             if (!enabled.Contains(group)) continue;                 // category group toggled off
-            if (pr.Exalted < GroundFloor(group)) continue;          // below this bucket's value floor (Unique/Currency/Other)
+            if (BelowFloor(pr.Exalted, GroundFloor(group))) continue;   // below this bucket's value floor (Unique/Currency/Other)
+            if (Untrusted(pr.Quantity)) continue;                   // too thin a market to state a value (see Untrusted)
             if (!_live.TryBarComponents(e.Address, out var render, out _)) continue;
             // Reveal the NAME only for an UNIDENTIFIED unique (the game's tag hides it). Everything else —
             // identified uniques, currency, runes, essences, … — draws a value-only chip over the drop.
@@ -1731,16 +1754,25 @@ public sealed class RadarApp : IDisposable
         _          => _settings.GroundItems.OtherMinEx,
     };
 
-    /// <summary>True when a PriceBook listing is backed by a positive-but-sub-threshold live-listing count
-    /// (<see cref="GroundItemSettings.MinQuantity"/>) — the low-confidence signal the overlay flags with a
-    /// "?" suffix on the value. poe.ninja reports volume=0 for many legitimately-priced fungibles (most
-    /// runes), so 0 means "no volume data", NOT low confidence — it's trusted. Only qty in [1,Min) flags.
-    /// The threshold lives on GroundItems as the shared pricing-confidence setting (ground + hover).</summary>
+    /// <summary>True when a PriceBook price is backed by fewer than
+    /// <see cref="GroundItemSettings.MinQuantity"/> units traded (exchange items) / listings (uniques).
+    /// A quantity of 0 IS low confidence — it means under half a unit changed hands — and only -1 (the
+    /// source gave no figure at all) is left unjudged. (This used to trust 0 as "no volume data", but the
+    /// 0s were thin markets truncated to zero: a Regal Shard priced at 28 ex off ~3 shards traded.)
+    /// The threshold lives on GroundItems as the shared pricing-confidence setting.</summary>
     private bool LowConfidence(int quantity)
     {
         var min = _settings.GroundItems.MinQuantity;
-        return min > 0 && quantity > 0 && quantity < min;
+        return min > 0 && quantity >= 0 && quantity < min;
     }
+
+    /// <summary>True when a low-confidence price should not be shown as a value at all on the things the
+    /// overlay volunteers (ground loot, loot tags, monolith / ritual / rune rewards).</summary>
+    private bool Untrusted(int quantity) => _settings.GroundItems.HideLowConfidence && LowConfidence(quantity);
+
+    /// <summary>Compare a price to a display floor at the precision it is DISPLAYED at (2 decimals), so a
+    /// value that prints as "1 ex" is not hidden by a "≥ 1 ex" floor for being 0.99994.</summary>
+    private static bool BelowFloor(double exalted, double floor) => Math.Round(exalted, 2) < floor;
 
     /// <summary>Parse a "#RRGGBB" hex colour to packed 0xFFRRGGBB once (opacity = 1, matching the old
     /// per-frame ParseColor(hex, 1f) for HP bars). Falls back to opaque white on a malformed string.</summary>
@@ -2438,14 +2470,15 @@ public sealed class RadarApp : IDisposable
         // Live node graph (atlas nodes are UiElements) — summary + the locally-visible highlight set.
         var nodes = _inGameStateForApi != 0 ? _atlas.ReadNodes(_inGameStateForApi) : new List<Poe2Atlas.AtlasNodeLive>();
         var vis = nodes.Where(n => n.Visible).ToList();
-        (int X, int Y)? rGoal, rStart; lock (_atlasLock) { rGoal = _atlasGoalGrid; rStart = _atlasStartGrid ?? _atlasRouteStartResolved; }
+        (int X, int Y)? rGoal, rStart, here;
+        lock (_atlasLock) { rGoal = _atlasGoalGrid; rStart = _atlasStartGrid ?? _atlasRouteStartResolved; here = _atlasHereGrid; }
         // Hop distance from "where you are" to EVERY node, for the dashboard's distance-sorted list: one
         // multi-source BFS seeded from the current node (when the marker resolves) or the runnable frontier.
         var hopsByGrid = new Dictionary<(int, int), int>();
         if (nodes.Count > 0)
         {
             var srcs = new List<(int, int)>();
-            if (_atlas.CurrentNodeGrid() is { } cgh && _atlas.GraphHas(cgh)) srcs.Add(cgh);
+            if (here is { } cgh && _atlas.GraphHas(cgh)) srcs.Add(cgh);
             else foreach (var n in nodes) if (n.Accessible) srcs.Add(n.Grid);
             if (srcs.Count > 0)
             {
@@ -2505,7 +2538,7 @@ public sealed class RadarApp : IDisposable
             routing = new
             {
                 graphNodes = _atlas.GraphNodeCount,
-                currentGrid = _atlas.CurrentNodeGrid() is { } cgd ? $"{cgd.X},{cgd.Y}" : null,
+                currentGrid = here is { } cgd ? $"{cgd.X},{cgd.Y}" : null,   // "you are here": game marker when trusted, else the last map run
                 accessible = nodes.Count(n => n.Accessible),
                 completed = nodes.Count(n => n.Completed),
                 published = _atlasRender is { } arn ? new
@@ -2646,6 +2679,11 @@ public sealed class RadarApp : IDisposable
             return;                                          // (manual START/END grids persist)
         }
         _atlasGoodAt = DateTime.UtcNow;
+        // One-time default seeding runs BEFORE the freeze check below. It waits for AllTagsResolved, and the
+        // tick on which that first turns true has an unchanged view signature — so when it sat behind the
+        // freeze return, seeding was skipped until the next pan/zoom (a fresh config opened on a static
+        // atlas showed nothing). Seeding changes the rule lists, which changes the signature → rebuild.
+        if (!_settings.AtlasTargetsSeeded || !_settings.AtlasGroupsSeeded) SeedAtlasDefaults(nodes);
         // Live zoom = the nodes' shared canvas scale (+0x130). Use the median (robust to a stray 0/odd node).
         // Drives both the ring projection and the route projection (relPos × winH/1600 × zoom).
         var scales = nodes.Where(n => n.Scale > 0.01f).Select(n => n.Scale).OrderBy(s => s).ToList();
@@ -2658,6 +2696,12 @@ public sealed class RadarApp : IDisposable
         // The player's CURRENT atlas node (the route source for auto-navigation). Changes only on zone
         // change, but it MUST feed the freeze signature so the auto-routes re-solve as the player advances.
         var curGrid = _atlas.CurrentNodeGrid();
+        // "You are here": the game's own marker when it is trusted (curGrid), otherwise the node of the last
+        // map the player ran (ResolveLastMapGrid). Drawn as the "YOU" ring AND used as the origin of every
+        // route (auto-routes + a start-less destination); null → routes fall back to the runnable frontier.
+        int completedCount = 0; foreach (var n in nodes) if (n.Completed) completedCount++;
+        var hereGrid = curGrid ?? ResolveLastMapGrid(nodes, completedCount);
+        lock (_atlasLock) _atlasHereGrid = hereGrid;   // for the dashboard (AtlasJson, API thread)
 
         // ARROW JITTER FIX — freeze the marks when the atlas view is static. PoE2 doesn't keep CULLED
         // (off-screen) UI elements' relPos cleanly updated, so off-screen nodes' positions are noisy — which
@@ -2692,6 +2736,7 @@ public sealed class RadarApp : IDisposable
         sig = sig * 1000003L ^ HashColors(_settings.AtlasHighlightColors);
         sig = sig * 1000003L ^ selSig;
         sig = sig * 1000003L ^ (curGrid?.GetHashCode() ?? 0);                       // re-solve routes as the player moves
+        sig = sig * 1000003L ^ (hereGrid?.GetHashCode() ?? 0) ^ ((long)completedCount << 12);   // marker + frontier move when a map is completed
         sig = sig * 1000003L ^ (_settings.AtlasAutoRoute ? 1L : 0L) ^ ((long)_settings.AtlasAutoRouteMaxHops << 1);
         sig = sig * 1000003L ^ ((long)_atlas.GraphNodeCount << 8);                  // re-solve when the edge vector grows (atlas streams in)
         // Rebuild when the #3 hide filters, #5 icon toggle, or #7 group set change.
@@ -2800,22 +2845,26 @@ public sealed class RadarApp : IDisposable
         // ── Auto-routing (improvement 1): "you are here" + a route to each tracked tile ──────────────
         // Sources = the player's CURRENT atlas node when known, else the accessible-now frontier (every
         // map you can run right now). One multi-source BFS gives the fewest-hops route to each tracked tile.
-        AtlasPoint? currentPt = (curGrid is { } cg && gridToPoint.TryGetValue(cg, out var ce)) ? ce : null;
+        AtlasPoint? currentPt = (hereGrid is { } cg && gridToPoint.TryGetValue(cg, out var ce)) ? ce : null;
         var autoRoutes = new List<AtlasAutoSpec>();
         if (_settings.AtlasAutoRoute && trackedGrids.Count > 0)
         {
-            // Sources = the ACCESSIBLE-NOW frontier (every map you can run right now) — fixed regardless of
-            // the mouse. We deliberately do NOT seed from the current-node marker: on some patches that
-            // element tracks the HOVERED tile, which made every route re-origin from the cursor ("navs to
-            // whatever I mouse over"). Fall back to the marker only when no accessible node is known (rare).
+            // Source = WHERE THE PLAYER IS (hereGrid: the trusted game marker, else the last map run) so every
+            // route begins at the "YOU" ring. hereGrid is stable — it only moves when a map is run — unlike
+            // the raw marker element, which on some patches tracks the HOVERED tile and made every route
+            // re-origin from the cursor ("navs to whatever I mouse over"); that one is only used when
+            // validated (CurrentNodeGrid returns null otherwise). When the position is unknown (fresh
+            // config, ambiguous match) fall back to the ACCESSIBLE-NOW frontier — every map runnable right
+            // now — which gives the fewest-hops route but starts each line at a different frontier map.
             // A tile being routed TO must never also count as a valid route-FROM source — otherwise it
             // trivially satisfies itself (0 hops) and the "already on the tile" check below swallows the
             // route, regardless of whether its Accessible read is actually right for that content kind.
             var trackedSet = new HashSet<(int, int)>(trackedGrids);
             var sources = new List<(int, int)>();
-            foreach (var n in nodes)
-                if (n.Accessible && !trackedSet.Contains(n.Grid)) sources.Add(n.Grid);
-            if (sources.Count == 0 && curGrid is { } c0 && _atlas.GraphHas(c0)) sources.Add(c0);
+            if (hereGrid is { } hg && _atlas.GraphHas(hg) && !trackedSet.Contains(hg)) sources.Add(hg);
+            else
+                foreach (var n in nodes)
+                    if (n.Accessible && !trackedSet.Contains(n.Grid)) sources.Add(n.Grid);
             if (sources.Count > 0)
             {
                 foreach (var kv in _atlas.RoutesFromSources(sources, trackedGrids).OrderBy(r => r.Value.Count))
@@ -2839,7 +2888,7 @@ public sealed class RadarApp : IDisposable
         var effStart = startGrid;
         if (effStart is null && goalGrid is { } goalG)
         {
-            if (curGrid is { } cg1 && _atlas.GraphHas(cg1)) effStart = cg1;
+            if (hereGrid is { } cg1 && cg1 != goalG && _atlas.GraphHas(cg1)) effStart = cg1;
             else
             {
                 var frontier = new List<(int, int)>();
@@ -2941,6 +2990,100 @@ public sealed class RadarApp : IDisposable
         Console.WriteLine(grid is { } g ? $"\n[atlas route] dashboard: END = {g} (routing from current node / runnable frontier)" : "\n[atlas route] dashboard: route cleared");
     }
     private (int X, int Y)? _atlasRouteStartResolved;   // the start UpdateAtlas picked for a start-less destination (for the dashboard)
+
+    // ── "You are here" on the atlas without the game's marker element (whose pointer field drifts per
+    //    patch — on the 2026-11 build the committed one follows the mouse). Instead: remember the last MAP
+    //    area the player was in (its area code, persisted), and resolve that to an atlas node. World thread. ──
+    private (int X, int Y)? _atlasHereGrid;               // last resolved position; guarded by _atlasLock (read by the API thread)
+    private uint _atlasLastMapHash;                       // AreaHash of the map instance last recorded
+    private HashSet<(int, int)>? _atlasPrevCompleted;     // completed grids at the previous full read
+    private HashSet<(int, int)>? _atlasPrevGrids;         // all grids at the previous full read
+    private (string Code, int Completed, int Nodes, string Area) _atlasResolveKey;   // inputs of the last resolve
+
+    /// <summary>Record the map the player is in (area codes of atlas maps start with "Map"). A new map
+    /// instance forgets the previously resolved node so it is re-resolved for this one.</summary>
+    private void TrackLastMap(string areaCode, uint areaHash)
+    {
+        if (areaHash == 0 || areaHash == _atlasLastMapHash) return;
+        if (!areaCode.StartsWith("Map", StringComparison.OrdinalIgnoreCase)) return;
+        var sameInstanceAsSaved = _atlasLastMapHash == 0
+            && string.Equals(_settings.AtlasLastMapCode, areaCode, StringComparison.OrdinalIgnoreCase);
+        _atlasLastMapHash = areaHash;
+        if (sameInstanceAsSaved) return;   // overlay restarted inside/after the same map: keep the saved node
+        _settings.AtlasLastMapCode = areaCode;
+        _settings.AtlasLastMapGrid = "";
+        _settings.Save();
+    }
+
+    private static (int X, int Y)? ParseGrid(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return null;
+        var i = s.IndexOf(',');
+        return i > 0 && int.TryParse(s.AsSpan(0, i), out var x) && int.TryParse(s.AsSpan(i + 1), out var y) ? (x, y) : null;
+    }
+
+    /// <summary>The atlas node of the last map the player ran, or null when it can't be told apart.
+    /// Resolution, in order: (1) a node that flipped to COMPLETED since the previous read and carries the
+    /// last map's code — that is unambiguously the map just finished; (2) the previously saved node;
+    /// (3) the only node with that code that is runnable-and-not-completed (a map that is open or was
+    /// left unfinished), else the only completed one, else a lone match. An ambiguous match (several
+    /// candidates in the same state, none seen flipping) yields null rather than a guess.</summary>
+    private (int X, int Y)? ResolveLastMapGrid(IReadOnlyList<Poe2Atlas.AtlasNodeLive> nodes, int completedCount)
+    {
+        var saved = ParseGrid(_settings.AtlasLastMapGrid);
+        var code = _settings.AtlasLastMapCode;
+        if (string.IsNullOrEmpty(code) || !_atlas.AllTagsResolved) return saved;   // map codes resolve over a few reads
+        // This runs every world tick while the Atlas is open: only redo the (allocating) resolve when one
+        // of its inputs changed — the last map, the completed set, the node set, or where the player is.
+        var key = (code, completedCount, nodes.Count, _worldAreaCode);
+        if (key == _atlasResolveKey) return saved;
+        _atlasResolveKey = key;
+
+        var completed = new HashSet<(int, int)>();
+        var grids = new HashSet<(int, int)>();
+        (int, int)? flipped = null; var flips = 0;
+        var matching = new List<Poe2Atlas.AtlasNodeLive>();
+        foreach (var n in nodes)
+        {
+            grids.Add(n.Grid);
+            if (n.Completed) completed.Add(n.Grid);
+            if (!string.Equals(n.MapCode, code, StringComparison.OrdinalIgnoreCase)) continue;
+            matching.Add(n);
+            // A flip only counts for a node that was ALREADY on the atlas at the previous read (the atlas
+            // streams nodes in, and a freshly streamed completed node is not a flip).
+            if (n.Completed && _atlasPrevCompleted is { } pc && !pc.Contains(n.Grid)
+                && _atlasPrevGrids is { } pg && pg.Contains(n.Grid)) { flipped = n.Grid; flips++; }
+        }
+        _atlasPrevCompleted = completed; _atlasPrevGrids = grids;
+
+        (int X, int Y)? pick = null;
+        if (flips == 1) pick = flipped;
+        // Keep an already-resolved node even when it isn't among the nodes read right now: the game streams
+        // atlas nodes in by region, so "not loaded at the moment" says nothing about it being wrong (and
+        // dropping it wiped the position every time the atlas reopened on another region). It is cleared
+        // only by TrackLastMap, when a new map instance is entered.
+        else if (saved != null) pick = saved;
+        else
+        {
+            // A map that is open or was left unfinished is RUNNABLE and not completed; a finished one is
+            // completed. Prefer the in-progress reading (it is the more specific state — there is rarely
+            // more than one runnable map of a type), then the finished one, then a lone match of any state.
+            var open = matching.Where(m => m.Accessible && !m.Completed).ToList();
+            var done = matching.Where(m => m.Completed).ToList();
+            if (open.Count == 1) pick = open[0].Grid;
+            else if (open.Count == 0 && done.Count == 1) pick = done[0].Grid;
+            else if (matching.Count == 1) pick = matching[0].Grid;
+        }
+
+        var text = pick is { } p ? $"{p.X},{p.Y}" : "";
+        if (text != (_settings.AtlasLastMapGrid ?? ""))
+        {
+            _settings.AtlasLastMapGrid = text; _settings.Save();
+            if (pick != null) Console.WriteLine($"\n[atlas] you-are-here = {text} ({code})");
+        }
+        return pick;
+    }
+    private string _worldAreaCode = "";                   // world thread: the current area code (for the above)
 
     /// <summary>API: set the active atlas highlight rules (tag + ring colour). Only nodes whose content
     /// tags or map name match one of these are drawn in-game, in the rule's colour. Persisted; applied on

@@ -560,6 +560,8 @@ internal static class DashboardHtml
               <label class="sw"><input type="checkbox" data-set="showTerrain"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Show player blip<small>blue dot marking your own position</small></div>
               <label class="sw"><input type="checkbox" data-set="showPlayerBlip"><span class="track"></span><span class="knob"></span></label></div>
+            <div class="row"><div class="rl">Hide in hideout<small>no radar, HP bars, routes or nav menu while in a hideout; the atlas overlay and price chips still show</small></div>
+              <label class="sw"><input type="checkbox" data-set="hideInHideout"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Always show overlay<small>draw even when PoE2 isn&rsquo;t focused (e.g. while tweaking this dashboard); auto-flask stays focus-gated</small></div>
               <label class="sw"><input type="checkbox" data-set="alwaysShowOverlay"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl">Hide junk entities<small>suppress cosmetic / FX / daemon dots</small></div>
@@ -664,8 +666,10 @@ internal static class DashboardHtml
             <div class="row"><div class="rl hint-row">These apply to <b>everything priced</b> below &mdash; ground loot, hover, monolith &amp; ritual rewards. Prices come from poe.ninja for the detected league.</div></div>
             <div class="row"><div class="rl">Price league<small>leave blank to auto-detect your league (HC/SC/Standard) from the game</small></div>
               <input class="numin" type="text" id="giLeague" data-gi="league" placeholder="auto-detect" style="width:200px"></div>
-            <div class="row"><div class="rl">Low-listing warning<small>flag a price backed by fewer than N live listings with a &ldquo;?&rdquo; (possible mislisting). 0 = never flag</small></div>
+            <div class="row"><div class="rl">Minimum trades to trust a price<small>a price backed by fewer than N units traded (currency, runes, gems&hellip;) or N listings (uniques) is treated as unreliable. 0 = trust everything</small></div>
               <input class="numin" type="number" step="1" min="0" data-gi="minQuantity"></div>
+            <div class="row"><div class="rl">Hide unreliable prices<small>on: show no value at all for them on ground loot, loot tags, monolith / ritual / rune rewards. off: show the value with a &ldquo;?&rdquo;. Hover prices always show with a &ldquo;?&rdquo;</small></div>
+              <label class="sw"><input type="checkbox" data-gi="hideLowConfidence"><span class="track"></span><span class="knob"></span></label></div>
             <div class="row"><div class="rl hint-row">Pricing status: <span id="priceStatus" style="color:var(--ink-dim)">&mdash;</span></div></div>
           </div>
 
